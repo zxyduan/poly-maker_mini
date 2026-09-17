@@ -13,11 +13,14 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+if TYPE_CHECKING:
+    from polymaker.catalog.scanner import ScanConfig
 
 
 class WalletConfig(BaseModel):
@@ -60,6 +63,85 @@ class ExecutionConfig(BaseModel):
     rate_budget_fraction: float = 0.25
     post_only: bool = True
     max_orders_per_batch: int = 15
+
+
+class ScanSettings(BaseModel):
+    """[scan] section: all discovery/scan filters, tags, and pagination.
+
+    Drives `polymaker scan`. Empty tag_slugs = no tag filter = full-site sweep.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # ── categories (Gamma tag slugs) ──
+    # list, multiple supported; empty [] = no tag filter (full site).
+    # Also accepts a comma-separated string "politics,sports,nba"; normalized on load.
+    tag_slugs: list[str] = []
+    related_tags: bool = True
+
+    # ── filters / thresholds ──
+    rewards_only: bool = False  # true = keep only liquidity-rewards markets (rate>0)
+    min_liquidity: float = 0.0  # server-side liquidity_num_min; 0 = no filter
+    min_volume_24hr: float = 0.0  # server-side volume_num_min; 0 = no filter
+    require_accepting_orders: bool = True  # false = also store non-accepting markets (browse only)
+    active_only: bool = True  # server-side active=true
+    exclude_closed: bool = True  # server-side closed=false
+    dedup: bool = True  # dedupe overlapping tags by condition_id
+
+    # ── binary switch ──
+    binary_only: bool = True  # false = non-binary markets exported to nonbinary_csv, NOT ingested
+    nonbinary_csv: str = "markets_nonbinary.csv"
+
+    # ── pagination / export ──
+    page_size: int = 100  # Gamma caps a page at 100
+    max_pages: int = 200  # per-scope page cap; warns if hit (possible truncation)
+    export_limit: int = 100_000  # markets.csv / markets list max rows
+
+    @field_validator("tag_slugs", mode="before")
+    @classmethod
+    def _normalize_tags(cls, v: object) -> object:
+        # Accept "politics,sports" or ["politics"," sports "]; strip, drop empties, dedupe.
+        if isinstance(v, str):
+            v = v.split(",")
+        if not isinstance(v, list):
+            return v
+        out: list[str] = []
+        for item in v:
+            s = str(item).strip().lower()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    @field_validator("min_liquidity", "min_volume_24hr")
+    @classmethod
+    def _non_negative(cls, x: float) -> float:
+        if x < 0:
+            raise ValueError("scan thresholds must be non-negative")
+        return x
+
+    def to_scan_config(self, gamma_host: str, clob_host: str, **overrides: Any) -> ScanConfig:
+        """Build the scanner-layer dataclass. Lazy import avoids config<->scanner cycle."""
+        from polymaker.catalog.scanner import ScanConfig
+
+        data: dict[str, Any] = dict(
+            tag_slugs=tuple(self.tag_slugs),
+            related_tags=self.related_tags,
+            rewards_only=self.rewards_only,
+            min_liquidity=self.min_liquidity,
+            min_volume_24hr=self.min_volume_24hr,
+            require_accepting_orders=self.require_accepting_orders,
+            active_only=self.active_only,
+            exclude_closed=self.exclude_closed,
+            dedup=self.dedup,
+            binary_only=self.binary_only,
+            nonbinary_csv=self.nonbinary_csv,
+            page_size=self.page_size,
+            max_pages=self.max_pages,
+            gamma_host=gamma_host,
+            clob_host=clob_host,
+        )
+        data.update(overrides)
+        return ScanConfig(**data)
 
 
 class PathsConfig(BaseModel):
@@ -192,6 +274,7 @@ class Config(BaseModel):
     engine: EngineConfig = EngineConfig()
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
+    scan: ScanSettings = ScanSettings()
     paths: PathsConfig = PathsConfig()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
@@ -235,6 +318,7 @@ class Config(BaseModel):
             engine=EngineConfig(**main.get("engine", {})),
             risk=RiskConfig(**main.get("risk", {})),
             execution=ExecutionConfig(**main.get("execution", {})),
+            scan=ScanSettings(**main.get("scan", {})),
             paths=PathsConfig(**main.get("paths", {})),
             profiles=profiles,
             markets=markets,

@@ -195,21 +195,39 @@ class Engine:
                 for tok in (meta.yes.token_id, meta.no.token_id):
                     self._token_cid[tok] = meta.condition_id
 
+    async def _scan_scopes(self, gamma: GammaClient) -> list[str | None]:
+        """Resolve configured tag slugs to tag_ids for the cold-start meta lookup.
+
+        Empty tag_slugs -> [None] (full-site, no tag filter). The engine only
+        trades binary markets, so no non-binary routing is needed here.
+        """
+        slugs = tuple(self.cfg.scan.tag_slugs)
+        if not slugs:
+            return [None]
+        scopes: list[str | None] = []
+        for slug in slugs:
+            tag_id = self.catalog.cached_tag(slug) or await gamma.resolve_tag_id(slug)
+            if tag_id:
+                self.catalog.cache_tag(slug, tag_id)
+                scopes.append(tag_id)
+        return scopes or [None]
+
     async def _fetch_meta(
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
         reward_rates: dict[str, float],
     ) -> MarketMeta | None:
-        tag_id = self.catalog.cached_tag("politics")
-        if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
-            tag_id = await gamma.resolve_tag_id("politics")
-            if tag_id:
-                self.catalog.cache_tag("politics", tag_id)
-        async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
-            if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
-                m = parse_market(raw, reward_rates)
-                if m:
-                    self.catalog.upsert_market(m)
-                return m
+        for tag_id in await self._scan_scopes(gamma):
+            async for raw in gamma.iter_markets(
+                tag_id=tag_id,
+                max_pages=self.cfg.scan.max_pages,
+                active_only=self.cfg.scan.active_only,
+                exclude_closed=self.cfg.scan.exclude_closed,
+            ):
+                if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
+                    m = parse_market(raw, reward_rates)
+                    if m:
+                        self.catalog.upsert_market(m)
+                    return m
         return None
 
     @staticmethod

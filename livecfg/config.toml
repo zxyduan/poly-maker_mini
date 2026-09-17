@@ -31,6 +31,23 @@ rate_budget_fraction = 0.15
 post_only = true
 max_orders_per_batch = 15
 
+[scan]
+# Conservative live settings: politics only, rewards only, binary only.
+tag_slugs = ["politics"]
+related_tags = true
+rewards_only = true
+min_liquidity = 1000.0
+min_volume_24hr = 0.0
+require_accepting_orders = true
+active_only = true
+exclude_closed = true
+dedup = true
+binary_only = true
+nonbinary_csv = "markets_nonbinary.csv"
+page_size = 100
+max_pages = 50
+export_limit = 10000
+
 [paths]
 db = "livecfg/state.db"
 journal_dir = "livecfg/journal"

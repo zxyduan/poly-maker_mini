@@ -92,7 +92,7 @@ async def run_doctor(cfg: Config, console: Console) -> bool:
         console.print(f"  [dim]· routing via proxy {cfg.proxy.split('@')[-1]}[/dim]")
 
     # ── live market WS: receive an actual book frame ────────────────────
-    token = held_tokens[0] if held_tokens else await _top_political_token(cfg)
+    token = held_tokens[0] if held_tokens else await _top_market_token(cfg)
     if token:
         passed, detail = await _market_ws_book(token, cfg.proxy)
         check("market WS live book frame", passed, detail)
@@ -159,11 +159,15 @@ async def _user_ws_auth(creds: Any, markets: list[str], proxy: str | None = None
         return False, str(e)[:80]
 
 
-async def _top_political_token(cfg: Config) -> str | None:
+async def _top_market_token(cfg: Config) -> str | None:
+    """Fetch the top-volume market's first token (for WS reachability probing).
+
+    No tag filter — any active market works for a connectivity check.
+    """
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             r = await c.get(f"{cfg.wallet.gamma_host}/markets",
-                            params={"limit": 1, "closed": "false", "tag_id": 2,
+                            params={"limit": 1, "closed": "false",
                                     "order": "volume24hr", "ascending": "false"})
             toks = json.loads(r.json()[0]["clobTokenIds"])
             return str(toks[0])

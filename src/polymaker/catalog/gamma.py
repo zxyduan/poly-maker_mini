@@ -2,9 +2,8 @@
 
 Gamma (https://gamma-api.polymarket.com, no auth) returns everything the v1
 scanner burned two extra REST calls per market to compute: best bid/ask,
-liquidity, volume, reward params, fee schedule, tick size, tokens. We filter
-server-side by the politics tag and liquidity/volume, so a full political-market
-sweep is a handful of paginated requests.
+liquidity, volume, reward params, fee schedule, tick size, tokens. Filters
+(tags, liquidity, volume, lifecycle) are configurable via the scanner config.
 """
 
 from __future__ import annotations
@@ -19,8 +18,6 @@ from polymaker.domain import MarketMeta, TokenMeta
 from polymaker.logging import get_logger
 
 log = get_logger("catalog.gamma")
-
-POLITICS_TAG_SLUG = "politics"
 
 
 class GammaClient:
@@ -75,8 +72,10 @@ class GammaClient:
         related_tags: bool = True,
         min_liquidity: float = 0.0,
         min_volume_24hr: float = 0.0,
+        active_only: bool = True,
+        exclude_closed: bool = True,
         limit: int = 100,  # Gamma caps a page at 100 regardless of a higher ask
-        max_pages: int = 25,
+        max_pages: int = 200,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield raw active/open market dicts, offset-paginated.
 
@@ -89,11 +88,13 @@ class GammaClient:
             params: dict[str, Any] = {
                 "limit": limit,
                 "offset": offset,
-                "active": "true",
-                "closed": "false",
                 "order": "volume24hr",
                 "ascending": "false",
             }
+            if active_only:
+                params["active"] = "true"
+            if exclude_closed:
+                params["closed"] = "false"
             if tag_id:
                 params["tag_id"] = tag_id
                 params["related_tags"] = "true" if related_tags else "false"
@@ -119,15 +120,24 @@ class GammaClient:
             offset += limit
 
 
-def parse_market(raw: dict[str, Any], reward_rates: dict[str, float] | None = None) -> MarketMeta | None:
-    """Convert a Gamma market dict into our MarketMeta, or None if unusable."""
+def parse_market(
+    raw: dict[str, Any],
+    reward_rates: dict[str, float] | None = None,
+    *,
+    require_accepting: bool = True,
+) -> MarketMeta | None:
+    """Convert a Gamma market dict into our MarketMeta, or None if unusable.
+
+    Only binary markets (exactly 2 outcomes/tokens) can be modeled — non-binary
+    markets are routed to a separate CSV by the scanner before calling this.
+    """
     try:
-        if not raw.get("acceptingOrders", False):
+        if require_accepting and not raw.get("acceptingOrders", False):
             return None
-        token_ids = _json_list(raw.get("clobTokenIds"))
-        outcomes = _json_list(raw.get("outcomes"))
+        token_ids = parse_json_list(raw.get("clobTokenIds"))
+        outcomes = parse_json_list(raw.get("outcomes"))
         if len(token_ids) != 2 or len(outcomes) != 2:
-            return None  # only binary markets
+            return None  # only binary markets; non-binary handled by scanner
 
         condition_id = raw["conditionId"]
         rate_map = reward_rates or {}
@@ -172,7 +182,22 @@ def parse_market(raw: dict[str, Any], reward_rates: dict[str, float] | None = No
         return None
 
 
-def _json_list(value: Any) -> list[Any]:
+def market_outcome_count(raw: dict[str, Any]) -> int | None:
+    """Return the number of outcomes/tokens for a market; None if unparseable.
+
+    Used by the scanner to route markets before parse_market: binary markets go
+    into the catalog, non-binary markets (when binary_only=false) go to a
+    separate CSV. parse_market itself still only constructs binary MarketMeta.
+    """
+    token_ids = parse_json_list(raw.get("clobTokenIds"))
+    outcomes = parse_json_list(raw.get("outcomes"))
+    if not token_ids or not outcomes:
+        return None
+    # token count is authoritative (outcomes should match; parse stage re-validates)
+    return len(token_ids)
+
+
+def parse_json_list(value: Any) -> list[Any]:
     """clobTokenIds / outcomes arrive as JSON-encoded strings."""
     if value is None:
         return []

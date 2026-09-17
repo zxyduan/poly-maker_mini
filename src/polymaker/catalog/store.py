@@ -53,6 +53,11 @@ class CatalogStore:
         self._conn.close()
 
     def upsert_market(self, meta: MarketMeta, score: MarketScore | None = None) -> None:
+        self._upsert_market_no_commit(meta, score)
+        self._conn.commit()
+
+    def _upsert_market_no_commit(self, meta: MarketMeta, score: MarketScore | None = None) -> None:
+        """Insert or update a single market WITHOUT committing — used by batch upsert."""
         sc = score or score_market(meta)
         self._conn.execute(
             """INSERT INTO markets(condition_id, question, slug, meta_json, score, score_json, scanned_ts)
@@ -70,7 +75,24 @@ class CatalogStore:
                 time.time(),
             ),
         )
-        self._conn.commit()
+
+    def upsert_markets(self, metas: list[MarketMeta]) -> int:
+        """Batch upsert many markets in a single transaction.
+
+        Critical for full-site sweeps (tens of thousands of markets): a per-row
+        commit would be an fsync per row and take minutes. Returns the count.
+        """
+        if not metas:
+            return 0
+        try:
+            self._conn.execute("BEGIN")
+            for m in metas:
+                self._upsert_market_no_commit(m)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return len(metas)
 
     def upsert_many(self, metas: list[MarketMeta]) -> int:
         for m in metas:

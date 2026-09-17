@@ -1,6 +1,6 @@
 """polymaker command-line interface.
 
-  polymaker scan                 sweep Gamma for political markets -> SQLite
+  polymaker scan                 sweep Gamma for markets -> SQLite (tags/filters from [scan])
   polymaker markets              rank/browse the catalog
   polymaker markets-add <slug>   append a market to config/markets.toml
   polymaker status               positions / open orders / PnL (reads SQLite)
@@ -40,26 +40,56 @@ def version() -> None:
 @app.command()
 def scan(
     config_dir: str = typer.Option("config", help="config directory"),
-    min_liquidity: float = typer.Option(1000.0, help="minimum market liquidity (USDC)"),
-    all_markets: bool = typer.Option(False, "--all", help="include non-rewards markets"),
+    min_liquidity: float | None = typer.Option(None, help="override [scan].min_liquidity"),
+    tag: list[str] = typer.Option(None, "--tag", help="override categories; repeatable; pass 'all' for full site"),  # noqa: B008
+    binary_only: bool | None = typer.Option(None, "--binary-only/--no-binary-only",
+                                             help="override [scan].binary_only"),
+    all_markets: bool = typer.Option(False, "--all", help="force include non-rewards markets"),
 ) -> None:
-    """Sweep Gamma for political markets, score, and persist to SQLite."""
-    from polymaker.catalog.scanner import ScanConfig, run_scan
+    """Sweep Gamma for markets (tags/filters from [scan] config), score, persist."""
+    import dataclasses
+
+    from polymaker.catalog.scanner import ScanResult, export_nonbinary_csv, run_scan
     from polymaker.catalog.store import CatalogStore
 
     cfg = Config.load(config_dir)
     store = CatalogStore(cfg.paths.db)
 
-    async def _go() -> int:
-        metas = await run_scan(store, ScanConfig(min_liquidity=min_liquidity, rewards_only=not all_markets))
-        return len(metas)
+    overrides: dict[str, object] = {}
+    if min_liquidity is not None:
+        overrides["min_liquidity"] = min_liquidity
+    if tag:
+        slugs: tuple[str, ...] = () if [t.lower() for t in tag] == ["all"] else tuple(tag)
+        overrides["tag_slugs"] = slugs
+    if binary_only is not None:
+        overrides["binary_only"] = binary_only
 
-    n = asyncio.run(_go())
+    async def _go() -> ScanResult:
+        scan_cfg = cfg.scan.to_scan_config(cfg.wallet.gamma_host, cfg.wallet.clob_host, **overrides)
+        if all_markets:
+            scan_cfg = dataclasses.replace(scan_cfg, rewards_only=False)
+        return await run_scan(store, scan_cfg)
+
+    result = asyncio.run(_go())
+
+    # binary markets -> SQLite (upserted inside run_scan) + markets.csv
     csv_path = Path(config_dir).parent / "markets.csv"
-    written = store.export_csv(csv_path)
-    console.print(f"[green]Scanned and stored {n} markets.[/green] "
-                  f"Wrote [bold]{csv_path}[/bold] ({written} rows) — open it, pick markets, "
-                  f"then `polymaker markets-add <slug>`.")
+    written = store.export_csv(csv_path, limit=cfg.scan.export_limit)
+
+    # non-binary markets -> standalone CSV (never ingested into SQLite)
+    nb_path = Path(config_dir).parent / cfg.scan.nonbinary_csv
+    nb_written = export_nonbinary_csv(result.nonbinary, nb_path) if result.nonbinary else 0
+
+    console.print(
+        f"[green]Scanned and stored {len(result.markets)} binary markets.[/green] "
+        f"Wrote [bold]{csv_path}[/bold] ({written} rows)."
+    )
+    if result.nonbinary:
+        console.print(
+            f"[yellow]Also found {len(result.nonbinary)} non-binary markets -> "
+            f"[bold]{nb_path}[/bold] ({nb_written} rows, not traded by the engine).[/yellow]"
+        )
+    console.print("Pick markets, then `polymaker markets-add <slug>`.")
     store.close()
 
 
@@ -78,7 +108,7 @@ def markets(
         console.print("[yellow]Catalog empty. Run `polymaker scan` first.[/yellow]")
         raise typer.Exit()
 
-    table = Table(title="Political markets by score")
+    table = Table(title="Markets by score")
     for col in ("score", "reward/day", "rebate/day", "spread", "tick", "neg", "question"):
         table.add_column(col, justify="right" if col != "question" else "left")
     for meta, sc in rows:
@@ -168,14 +198,14 @@ def pnl(config_dir: str = typer.Option("config", help="config directory")) -> No
 def export_csv(
     config_dir: str = typer.Option("config", help="config directory"),
     out: str = typer.Option("markets.csv", help="output CSV path"),
-    limit: int = typer.Option(500, help="max rows"),
+    limit: int = typer.Option(None, help="max rows (default: [scan].export_limit)"),
 ) -> None:
     """Export the scored market catalog to a CSV for easy picking."""
     from polymaker.catalog.store import CatalogStore
 
     cfg = Config.load(config_dir)
     store = CatalogStore(cfg.paths.db)
-    n = store.export_csv(out, limit)
+    n = store.export_csv(out, limit if limit is not None else cfg.scan.export_limit)
     store.close()
     console.print(f"[green]Wrote {n} markets to {out}.[/green]")
 

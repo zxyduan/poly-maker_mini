@@ -45,6 +45,34 @@ rate_budget_fraction = 0.25     # fraction of documented API limits we allow
 post_only = true                # every quote is post-only (maker-only mandate)
 max_orders_per_batch = 15       # exchange batch cap
 
+[scan]
+# ── categories (Gamma tag slugs) ──
+# list, multiple supported; empty [] = no tag filter (full-site sweep).
+# Also accepts a comma-separated string "politics,sports,nba".
+tag_slugs = [
+  "politics", "sports", "nba", "nfl", "soccer", "ufc",
+  "crypto", "economy", "tech", "entertainment", "world", "health", "climate",
+]
+related_tags = true              # include related-tag markets when filtering by tag
+
+# ── filters / thresholds ──
+rewards_only       = false       # true = keep only liquidity-rewards markets (rate>0)
+min_liquidity      = 0.0         # server-side liquidity_num_min (USDC); 0 = no filter
+min_volume_24hr    = 0.0         # server-side volume_num_min; 0 = no filter
+require_accepting_orders = true  # false = also store non-accepting markets (browse only)
+active_only        = true        # server-side active=true
+exclude_closed     = true        # server-side closed=false
+dedup              = true        # dedupe overlapping tags by condition_id
+
+# ── binary switch ──
+binary_only        = true        # false = non-binary markets exported to nonbinary_csv, NOT ingested
+nonbinary_csv      = "markets_nonbinary.csv"
+
+# ── pagination / export ──
+page_size          = 100         # Gamma caps a page at 100
+max_pages          = 200         # per-scope page cap; warns if hit (possible truncation)
+export_limit       = 100000      # markets.csv / markets list max rows
+
 [paths]
 db = "state.db"
 journal_dir = "journal"
