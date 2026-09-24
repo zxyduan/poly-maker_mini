@@ -66,21 +66,15 @@ def construct_one_way_quotes(
         if touch is not None:
             floor_price = pos_yes.avg_price + p.ow_edge_base_ticks * tick
             if exit_only or toxicity > p.ow_panic_toxicity:
-                prices, fracs = [touch], [1.0]
-                sell_mode = "panic_touch"
-            elif wall is not None:
-                wp, ws = wall
-                if held < ws:
-                    prices, fracs = [wp - tick], [1.0]   # 小：墙后排队
-                    sell_mode = "behind_wall"
-                else:
-                    prices, fracs = [touch], [1.0]       # 大：抢跑
-                    sell_mode = "jump_touch"
+                # 剧烈波动/到期：紧急出货，贴 best_bid 直接砸出去
+                panic_price = bb.price if bb is not None else touch
+                prices, fracs = [panic_price], [1.0]
+                sell_mode = "panic_sell_bid"
             else:
-                n = max(1, p.ow_sell_split_levels)       # 稀薄：分价位
-                prices = [touch + i * tick for i in range(n)]
-                fracs = [1.0 / n] * n
-                sell_mode = "split_thin"
+                # 盘口平静：挂 best_ask - 1tick（比现有卖盘便宜一档，抢跑先成交）
+                calm_price = touch - tick
+                prices, fracs = [calm_price], [1.0]
+                sell_mode = "caml_under_ask"
 
             for pr, fr in zip(prices, fracs):
                 pr = max(pr, floor_price)
@@ -129,16 +123,25 @@ def construct_one_way_quotes(
             search_cap = best_bid
             last_price: float | None = None
             for i, w in enumerate(weights):
-                # 第 i 层基础价：贴 touch 起，每层往下 step_ticks（找不到墙时用）
-                base_price = best_bid - i * p.layer_step_ticks * tick
-                wall = _find_wall_below(yes_book, search_cap, wall_notional)
-                if wall is not None:
-                    # bid 侧挂买：挂墙上方（墙价+skip tick）= 排在墙前面先成交，
-                    # 不超过 best_bid（不能挂到卖价那边）。
-                    price = min(wall + p.ow_wall_skip_ticks * tick, best_bid)
-                    search_cap = wall - p.ow_wall_min_gap_ticks * tick
+                # 第 0 层永远贴 best_bid（最优买价，最容易成交），不找墙；
+                # 更深层才锚定墙（墙上方 1 tick 抢跑）。
+                # 第1层成交后，第2-4层锁在成交价(avg)下方，不随 best_bid 上移（不追高）
+                ref = pos_yes.avg_price if held >= meta.min_order_size else best_bid
+                base_price = ref - i * p.layer_step_ticks * tick
+                if i == 0:
+                    # 空仓挂 best_bid 抢成交；已成交则不再追高，跳过第1层，
+                    # 等卖单成交库存回低位再补。
+                    if held >= meta.min_order_size:
+                        continue
+                    price = best_bid
                 else:
-                    price = base_price
+                    wall = _find_wall_below(yes_book, search_cap, wall_notional)
+                    if wall is not None:
+                        wp = wall[0]
+                        price = min(wp + p.ow_wall_skip_ticks * tick, search_cap)
+                        search_cap = wp - p.ow_wall_min_gap_ticks * tick
+                    else:
+                        price = base_price
                 # 单调递减：保证每层一定比上一层便宜（挂买不越挂越贵）
                 if last_price is not None:
                     price = min(price, last_price - p.layer_step_ticks * tick)
@@ -161,8 +164,9 @@ def construct_one_way_quotes(
     ba_lv = yes_book.best_ask() if yes_book is not None else None
     bid_top3 = list(yes_book.bids.items())[-3:][::-1] if yes_book is not None else []
     ask_top3 = list(yes_book.asks.items())[:3] if yes_book is not None else []
-    bid_wall = (_find_wall_below(yes_book, bb_lv.price, wall_notional)
-                if (yes_book and bb_lv is not None) else None)
+    _bw = (_find_wall_below(yes_book, bb_lv.price, wall_notional)
+           if (yes_book and bb_lv is not None) else None)
+    bid_wall = _bw[0] if _bw else None
     log.info("ow_quote", cid=cid[:8], held=round(held, 2), inv_util=round(u, 2),
              buy_scale=round(buy_scale, 2),
              bb=bb_lv.price if bb_lv else None,
@@ -197,17 +201,17 @@ def _normalize(weights: list[float]) -> list[float]:
 
 def _find_wall_below(
     book: OrderBook, from_price: float, wall_notional: float
-) -> float | None:
+) -> tuple[float, float] | None:
     """Highest bid level at or below `from_price` whose notional (price×size)
-    clears `wall_notional`. None when no such wall."""
+    clears `wall_notional`. Returns (price, size) or None."""
     if wall_notional <= 0:
         return None
-    # bids ascending; walk high -> low, skip levels above our target
     for price in reversed(book.bids):
         if price > from_price + _EPS:
             continue
-        if price * book.bids[price] >= wall_notional:
-            return price
+        size = book.bids[price]
+        if price * size >= wall_notional:
+            return price, size
     return None
 
 

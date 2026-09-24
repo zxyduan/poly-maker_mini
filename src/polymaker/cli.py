@@ -301,82 +301,83 @@ def books(
     config_dir: str = typer.Option("config", help="config directory"),
     out: str = typer.Option("books.csv", help="output CSV path"),
 ) -> None:
-    """Snapshot order books in markets.csv format (one row per market)."""
+    """Snapshot order books in markets.csv format, append one row per market."""
     import csv
     import os
-    from datetime import datetime
+    from datetime import datetime, timezone
     from polymaker.catalog.store import CatalogStore
-    from polymaker.catalog.gamma import GammaClient, parse_market
+    from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
     from polymaker.catalog.scoring import score_market
     from polymaker.execution.gateway import ExecutionGateway
-
     cfg = Config.load(config_dir)
     store = CatalogStore(cfg.paths.db)
-    fields = [  # ① 第一列 = 快照时间(精确到小时)，原 18 列从第二列开始
-        "snapshot_ts", "score", "reward_pool_per_day", "rebate_pool_per_day", "spread",
-        "best_bid", "best_ask", "tick", "min_size", "neg_risk", "taker_fee_pct",
-        "rebate_pct", "rewards_max_spread", "liquidity", "volume_24h",
-        "end_date", "question", "slug", "condition_id",
+    fields = [
+        "snapshot_ts", "score", "reward_pool_per_day", "rebate_pool_per_day",
+        "spread", "best_bid", "best_ask", "tick", "min_size", "neg_risk",
+        "taker_fee_pct", "rebate_pct", "rewards_max_spread", "liquidity",
+        "volume_24h", "end_date", "question", "slug", "condition_id",
     ]
+    ts = datetime.now(timezone.utc).strftime("%Y/%m/%d %H:00")
 
-    async def resolve_meta(gamma: GammaClient, entry: object) -> object | None:
-        """兜底：缓存没有时按 condition_id/slug 从 Gamma 拉（不依赖奖励费率）"""
-        try:
-            if entry.condition_id:
-                got = await gamma.markets_by_condition([entry.condition_id])
-                raw = got.get(entry.condition_id)
-                if raw:
-                    m = parse_market(raw)
-                    if m:
-                        store.upsert_market(m)
-                    return m
-            async for raw in gamma.iter_markets(max_pages=25):
-                if entry.slug and raw.get("slug") == entry.slug:
-                    m = parse_market(raw)
-                    if m:
-                        store.upsert_market(m)
-                    return m
-        except Exception:
+    async def refresh_one(gamma: GammaClient, slug: str,
+                          rates: dict[str, float]) -> object | None:
+        """按 slug 本地找 cid，再用 condition_ids 直拉 Gamma 更新单市场。"""
+        local = store.get_by_slug(slug)
+        if local is None:
+            console.print(f"[yellow]skip {slug}: 本地无缓存，先跑一次 run 建库[/yellow]")
             return None
-        return None
+        if not local.condition_id:
+            console.print(f"[yellow]skip {slug}: 缓存里没有 condition_id[/yellow]")
+            return local
+        try:
+            raws = await gamma.markets_by_condition([local.condition_id])
+            raw = raws.get(local.condition_id)
+            if not raw:
+                console.print(f"[yellow]warn {slug}: Gamma 没返回 {local.condition_id[:8]}[/yellow]")
+                return local
+            m = parse_market(raw, rates)
+            if m is None:
+                console.print(f"[yellow]warn {slug}: parse_market 返回 None[/yellow]")
+                return local
+            store.upsert_market(m)
+            return m
+        except Exception as exc:
+            console.print(f"[red]error {slug}: {type(exc).__name__}: {exc}[/red]")
+            return local
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:00")   # ② 一次运行 = 一个快照时刻，精确到小时
     async def _go() -> int:
         rows = []
         enabled = (cfg.enabled_markets
                    if isinstance(cfg.enabled_markets, list)
                    else cfg.enabled_markets())
-        gw = ExecutionGateway(cfg, journal=None)
-        for entry in enabled:
-            meta = store.get_by_slug(entry.slug)
-            if meta is None and (entry.slug or entry.condition_id):
-                async with GammaClient(cfg.wallet.gamma_host) as gamma:
-                    meta = await resolve_meta(gamma, entry)
-            if meta is None:
-                console.print(f"[yellow]skip {entry.slug or entry.condition_id}: no meta[/yellow]")
-                continue
-            b = await gw.get_book(meta.yes.token_id)
-            if not b:
-                console.print(f"[yellow]skip {meta.slug}: book fetch failed[/yellow]")
-                continue
-            sc = score_market(meta)
-            rows.append([
-                ts,                                        # ③ 第一列 = 快照时间
-                f"{sc.score:.3f}", f"{meta.rewards_daily_rate:.2f}",
-                f"{sc.rebate_potential:.2f}",
-                f"{b.get('best_ask', 0) - b.get('best_bid', 0):.4f}",
-                b.get("best_bid"), b.get("best_ask"), f"{meta.tick_size:g}",
-                f"{meta.min_order_size:g}", int(meta.neg_risk),
-                f"{meta.taker_fee_bps / 100:.1f}", f"{meta.rebate_rate * 100:.0f}",
-                meta.rewards_max_spread, f"{meta.liquidity_num:.0f}",
-                f"{meta.volume_24hr:.0f}", meta.end_date_iso or "",
-                meta.question, meta.slug, meta.condition_id,
-            ])
-        # ④ 追加模式：文件是新的才写表头，否则只追加数据行
-        file_exists = os.path.exists(out) and os.path.getsize(out) > 0
+        async with GammaClient(cfg.wallet.gamma_host) as gamma:
+            rates = await fetch_reward_rates(cfg.wallet.clob_host)
+            gw = ExecutionGateway(cfg, journal=None)
+            for entry in enabled:
+                meta = await refresh_one(gamma, entry.slug, rates)
+                if meta is None:
+                    continue
+                b = await gw.get_book(meta.yes.token_id)
+                if not b:
+                    console.print(f"[yellow]skip {meta.slug}: 盘口拉不到[/yellow]")
+                    continue
+                sc = score_market(meta)
+                rows.append([
+                    ts,
+                    f"{sc.score:.3f}", f"{meta.rewards_daily_rate:.2f}",
+                    f"{sc.rebate_potential:.2f}",
+                    f"{b.get('best_ask', 0) - b.get('best_bid', 0):.4f}",
+                    b.get("best_bid"), b.get("best_ask"), f"{meta.tick_size:g}",
+                    f"{meta.min_order_size:g}", int(meta.neg_risk),
+                    f"{meta.taker_fee_bps / 100:.1f}", f"{meta.rebate_rate * 100:.0f}",
+                    meta.rewards_max_spread, f"{meta.liquidity_num:.0f}",
+                    f"{meta.volume_24hr:.0f}", meta.end_date_iso or "",
+                    meta.question, meta.slug, meta.condition_id,
+                ])
+        write_header = not os.path.exists(out)
         with open(out, "a", newline="") as fh:
             w = csv.writer(fh)
-            if not file_exists:
+            if write_header:
                 w.writerow(fields)
             w.writerows(rows)
         return len(rows)
