@@ -195,39 +195,21 @@ class Engine:
                 for tok in (meta.yes.token_id, meta.no.token_id):
                     self._token_cid[tok] = meta.condition_id
 
-    async def _scan_scopes(self, gamma: GammaClient) -> list[str | None]:
-        """Resolve configured tag slugs to tag_ids for the cold-start meta lookup.
-
-        Empty tag_slugs -> [None] (full-site, no tag filter). The engine only
-        trades binary markets, so no non-binary routing is needed here.
-        """
-        slugs = tuple(self.cfg.scan.tag_slugs)
-        if not slugs:
-            return [None]
-        scopes: list[str | None] = []
-        for slug in slugs:
-            tag_id = self.catalog.cached_tag(slug) or await gamma.resolve_tag_id(slug)
-            if tag_id:
-                self.catalog.cache_tag(slug, tag_id)
-                scopes.append(tag_id)
-        return scopes or [None]
-
     async def _fetch_meta(
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
         reward_rates: dict[str, float],
     ) -> MarketMeta | None:
-        for tag_id in await self._scan_scopes(gamma):
-            async for raw in gamma.iter_markets(
-                tag_id=tag_id,
-                max_pages=self.cfg.scan.max_pages,
-                active_only=self.cfg.scan.active_only,
-                exclude_closed=self.cfg.scan.exclude_closed,
-            ):
-                if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
-                    m = parse_market(raw, reward_rates)
-                    if m:
-                        self.catalog.upsert_market(m)
-                    return m
+        tag_id = self.catalog.cached_tag("politics")
+        if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
+            tag_id = await gamma.resolve_tag_id("politics")
+            if tag_id:
+                self.catalog.cache_tag("politics", tag_id)
+        async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
+            if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
+                m = parse_market(raw, reward_rates)
+                if m:
+                    self.catalog.upsert_market(m)
+                return m
         return None
 
     @staticmethod
@@ -462,13 +444,42 @@ class Engine:
             p,
         )
 
-        tq = construct_quotes(QuoteInputs(
-            meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
-            toxicity=est.markout.toxicity, yes_view=yes_book.view(),
-            no_view=(no_book.view() if no_book else _empty_view()),
-            pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
-            risk_size_scale=rd.size_scale,
-        ))
+        # ── 羊毛策略分支（type="wool" 时走新逻辑，原有双边做市不受影响）──
+        if getattr(p, "type", "maker") == "wool":
+            # 延迟导入：只有羊毛策略才加载 wool.py，不影响现有策略启动
+            from polymaker.strategy.wool import construct_wool_quotes
+            tq = construct_wool_quotes(
+                meta=meta,
+                profile=p,
+                yes_book=yes_book,
+                no_book=no_book,
+                now=now,
+            )
+        elif getattr(p, "type", "maker") == "one_way":
+            # 延迟导入：单边做市按需加载，不影响其他策略启动
+            from polymaker.strategy.one_way import construct_one_way_quotes
+            tq = construct_one_way_quotes(
+                meta=meta,
+                profile=p,
+                yes_book=yes_book,
+                no_book=no_book,
+                now=now,
+                fv=fv,
+                vol_short=est.vol.short,
+                toxicity=est.markout.toxicity,
+                pos_yes=pos_yes,
+                risk_size_scale=rd.size_scale,
+                hours_to_end=hours_to_end,
+            )
+        else:
+            # 原有双边做市逻辑（完全不动）
+            tq = construct_quotes(QuoteInputs(
+                meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
+                toxicity=est.markout.toxicity, yes_view=yes_book.view(),
+                no_view=(no_book.view() if no_book else _empty_view()),
+                pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
+                risk_size_scale=rd.size_scale,
+            ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
         plan = reconcile(tq, live, tick=meta.tick_size,

@@ -13,14 +13,11 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-if TYPE_CHECKING:
-    from polymaker.catalog.scanner import ScanConfig
 
 
 class WalletConfig(BaseModel):
@@ -63,85 +60,6 @@ class ExecutionConfig(BaseModel):
     rate_budget_fraction: float = 0.25
     post_only: bool = True
     max_orders_per_batch: int = 15
-
-
-class ScanSettings(BaseModel):
-    """[scan] section: all discovery/scan filters, tags, and pagination.
-
-    Drives `polymaker scan`. Empty tag_slugs = no tag filter = full-site sweep.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    # ── categories (Gamma tag slugs) ──
-    # list, multiple supported; empty [] = no tag filter (full site).
-    # Also accepts a comma-separated string "politics,sports,nba"; normalized on load.
-    tag_slugs: list[str] = []
-    related_tags: bool = True
-
-    # ── filters / thresholds ──
-    rewards_only: bool = False  # true = keep only liquidity-rewards markets (rate>0)
-    min_liquidity: float = 0.0  # server-side liquidity_num_min; 0 = no filter
-    min_volume_24hr: float = 0.0  # server-side volume_num_min; 0 = no filter
-    require_accepting_orders: bool = True  # false = also store non-accepting markets (browse only)
-    active_only: bool = True  # server-side active=true
-    exclude_closed: bool = True  # server-side closed=false
-    dedup: bool = True  # dedupe overlapping tags by condition_id
-
-    # ── binary switch ──
-    binary_only: bool = True  # false = non-binary markets exported to nonbinary_csv, NOT ingested
-    nonbinary_csv: str = "markets_nonbinary.csv"
-
-    # ── pagination / export ──
-    page_size: int = 100  # Gamma caps a page at 100
-    max_pages: int = 200  # per-scope page cap; warns if hit (possible truncation)
-    export_limit: int = 100_000  # markets.csv / markets list max rows
-
-    @field_validator("tag_slugs", mode="before")
-    @classmethod
-    def _normalize_tags(cls, v: object) -> object:
-        # Accept "politics,sports" or ["politics"," sports "]; strip, drop empties, dedupe.
-        if isinstance(v, str):
-            v = v.split(",")
-        if not isinstance(v, list):
-            return v
-        out: list[str] = []
-        for item in v:
-            s = str(item).strip().lower()
-            if s and s not in out:
-                out.append(s)
-        return out
-
-    @field_validator("min_liquidity", "min_volume_24hr")
-    @classmethod
-    def _non_negative(cls, x: float) -> float:
-        if x < 0:
-            raise ValueError("scan thresholds must be non-negative")
-        return x
-
-    def to_scan_config(self, gamma_host: str, clob_host: str, **overrides: Any) -> ScanConfig:
-        """Build the scanner-layer dataclass. Lazy import avoids config<->scanner cycle."""
-        from polymaker.catalog.scanner import ScanConfig
-
-        data: dict[str, Any] = dict(
-            tag_slugs=tuple(self.tag_slugs),
-            related_tags=self.related_tags,
-            rewards_only=self.rewards_only,
-            min_liquidity=self.min_liquidity,
-            min_volume_24hr=self.min_volume_24hr,
-            require_accepting_orders=self.require_accepting_orders,
-            active_only=self.active_only,
-            exclude_closed=self.exclude_closed,
-            dedup=self.dedup,
-            binary_only=self.binary_only,
-            nonbinary_csv=self.nonbinary_csv,
-            page_size=self.page_size,
-            max_pages=self.max_pages,
-            gamma_host=gamma_host,
-            clob_host=clob_host,
-        )
-        data.update(overrides)
-        return ScanConfig(**data)
 
 
 class PathsConfig(BaseModel):
@@ -199,6 +117,50 @@ class StrategyProfile(BaseModel):
     # exits
     exit_urgency_s: float = 900.0
     merge_min_size: float = 20.0
+
+    # ── 羊毛策略专属字段（type="wool" 时生效）──
+    # 策略类型："maker"（默认，原有双边做市）| "wool"（深度挂单薅奖励）
+    type: str = "maker"
+    # 羊毛：单市场投入金额（USDC，0=用 base_size_usdc）
+    per_market_usdc: float = 0.0
+    # 羊毛：挂哪一侧 "yes" | "no"
+    wool_side: str = "yes"
+    # 羊毛：锚定大单密集区的深度百分比（0=不锚定，用固定深度）
+    # 0.7 = 挂在累计深度70%分位的价格（大单后面）
+    anchor_depth_pct: float = 0.0
+    # 羊毛：提前 N 天停止挂单（临近结算前退出，锁定收益）
+    exit_days_before: float = 0.0
+    # 羊毛：价格地板（最低挂单价，0=不设地板）
+    wool_floor_price: float = 0.0
+
+    # ── 单边做市专属字段（type="one_way" 时生效）──
+    # 只做 BUY YES（小概率方）：下行有限，突发事件=利好
+    ow_side: str = "yes"
+    # 金字塔加仓份额：贴 touch→深处递增（1:2:3:4）；实际挂单打到价格地板会自动停，
+    # 低 mid 市场自然只出 1~2 层，不会凑数。
+    ow_pyramid_shares: list[float] = Field(default_factory=lambda: [0.10, 0.20, 0.30, 0.40])
+    # 大单墙阈值：某档名义(份额×价格) >= volume_24hr × 此比例 算厚墙
+    ow_wall_pct_of_24h: float = 0.005
+    # 挂墙后方便宜 N tick（墙不破便宜排队，墙破先吃）
+    ow_wall_skip_ticks: int = 1
+    # 墙与墙之间最小间隔（tick）：下一层墙必须比上一层墙再低这么多，避免多层叠在一堵墙后
+    ow_wall_min_gap_ticks: int = 5
+    # 动态 edge 基础 tick 数（c_vol/c_tox 复用现有字段叠加）
+    ow_edge_base_ticks: int = 5
+    # 卖盘无墙（盘口稀薄）时，持仓分几档价位出
+    ow_sell_split_levels: int = 3
+    # 阴跌三级刹车线（库存利用率 u = 持仓/q_max）
+    ow_inv_low: float = 0.33
+    ow_inv_mid: float = 0.66
+    # flow_z 连续 N 个周期为负才确认阴跌趋势
+    ow_flowz_confirm: int = 5
+    # 砸盘快信号
+    ow_panic_toxicity: float = 0.6
+    ow_bid_drop_ticks: int = 3
+    ow_panic_seconds: float = 10.0
+    ow_cooldown_s: float = 45.0
+    # 到期前 N 天只卖不买
+    ow_exit_days_before: float = 30.0
 
     def with_overrides(self, overrides: dict[str, Any]) -> StrategyProfile:
         """Return a copy with per-market override values applied."""
@@ -274,7 +236,6 @@ class Config(BaseModel):
     engine: EngineConfig = EngineConfig()
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
-    scan: ScanSettings = ScanSettings()
     paths: PathsConfig = PathsConfig()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
@@ -318,7 +279,6 @@ class Config(BaseModel):
             engine=EngineConfig(**main.get("engine", {})),
             risk=RiskConfig(**main.get("risk", {})),
             execution=ExecutionConfig(**main.get("execution", {})),
-            scan=ScanSettings(**main.get("scan", {})),
             paths=PathsConfig(**main.get("paths", {})),
             profiles=profiles,
             markets=markets,

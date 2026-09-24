@@ -1,10 +1,6 @@
 # Trade list (supervised MM session).
 [[markets]]
-slug    = "will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568"
-profile = "newsom-mm"
+slug    = "clarity-act-signed-into-law-in-2026"
+profile = "one_way"
 enabled = true
 
-[[markets]]
-slug    = "will-alexandru-nazare-be-the-next-prime-minister-of-romania"
-profile = "romania-pm"
-enabled = true
