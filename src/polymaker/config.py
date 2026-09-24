@@ -141,6 +141,8 @@ class StrategyProfile(BaseModel):
     ow_pyramid_shares: list[float] = Field(default_factory=lambda: [0.10, 0.20, 0.30, 0.40])
     # 大单墙阈值：某档名义(份额×价格) >= volume_24hr × 此比例 算厚墙
     ow_wall_pct_of_24h: float = 0.005
+    # 买单第一层 reprice 容忍：best_bid 变动 <= N tick 不撤单，保持队列位置
+    ow_reprice_ticks: int = 2
     # 挂墙后方便宜 N tick（墙不破便宜排队，墙破先吃）
     ow_wall_skip_ticks: int = 1
     # 墙与墙之间最小间隔（tick）：下一层墙必须比上一层墙再低这么多，避免多层叠在一堵墙后

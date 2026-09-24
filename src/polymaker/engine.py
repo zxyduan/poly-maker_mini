@@ -482,8 +482,9 @@ class Engine:
             ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
+        rpt = p.ow_reprice_ticks if p.type == "one_way" else p.reprice_ticks
         plan = reconcile(tq, live, tick=meta.tick_size,
-                         reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
+                         reprice_ticks=rpt, resize_frac=p.resize_frac)
         if plan.is_noop:
             self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
             return
