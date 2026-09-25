@@ -188,12 +188,19 @@ class ExecutionGateway:
     def _parse_place_response(self, resp: Any, quotes: list[Quote]) -> list[OpenOrder]:
         """Map a batch post response to OpenOrders. Tolerant of shape variants;
         the user-WS order events + REST snapshot reconcile anything we miss."""
+        log.info("place_resp", resp=str(resp)[:500],
+                 n_quotes=len(quotes),
+                 sides=[q.side.value for q in quotes],
+                 prices=[q.price for q in quotes],
+                 sizes=[q.size for q in quotes])
         items = resp if isinstance(resp, list) else resp.get("orders", resp.get("data", []))
         out: list[OpenOrder] = []
         for q, item in zip(quotes, items if isinstance(items, list) else [], strict=False):
             oid = _first(item, "orderID", "orderId", "order_id", "id", "hash")
             if not oid:
-                log.warning("place_response_missing_id", item=str(item)[:120])
+                log.warning("place_response_missing_id",
+                            item=str(item)[:200],
+                            side=q.side.value, price=q.price, size=q.size)
                 continue
             out.append(OpenOrder(str(oid), q.token_id, q.side, q.price, q.size, OrderState.LIVE))
         return out

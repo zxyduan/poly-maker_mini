@@ -132,6 +132,7 @@ def construct_one_way_quotes(
                     # 空仓挂 best_bid 抢成交；已成交则不再追高，跳过第1层，
                     # 等卖单成交库存回低位再补。
                     if held >= meta.min_order_size:
+                        last_price = pos_yes.avg_price # 第1层跳过也要设 last_price=avg，否则第2层没有单调递减约束，会追高挂 best_bid
                         continue
                     price = best_bid
                 else:
