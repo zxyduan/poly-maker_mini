@@ -57,7 +57,6 @@ class ExecutionGateway:
         self._order_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._cancel_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._paper_ids = itertools.count(1)
-        self._hb_id: str = ""  # heartbeat chain
         self._hb_failures: int = 0
         # dedicated, bounded pool for blocking order/HTTP calls so a burst of
         # requotes across many markets can't starve the default executor
@@ -410,30 +409,45 @@ class ExecutionGateway:
 
     # ── heartbeat (dead-man switch) ─────────────────────────────────────
     async def heartbeat(self) -> bool:
-        """Send one chained heartbeat. Returns True on success.
+        """Send one heartbeat tick. Returns True on success.
 
-        The exchange expects each heartbeat to carry the previous heartbeat_id.
-        Consecutive failures are tracked in `heartbeat_failures`: after enough
-        misses the exchange auto-cancels ALL our orders, so the engine must
-        stop quoting and resync once the heartbeat recovers.
+        Current exchange contract: ``POST {host}/heartbeats`` with L2
+        headers only and NO body; any HTTP 200 is the ack. py-clob-client-v2
+        (pinned 1.0.2) still implements the legacy chained contract
+        (``POST /v1/heartbeats`` carrying a heartbeat_id), which the
+        production server rejects with 400 "Invalid Heartbeat ID" — so we
+        sign and POST the bodyless tick directly. Consecutive failures are
+        tracked in `heartbeat_failures`; after `heartbeat_halt_failures`
+        misses the engine stops quoting and resyncs once this recovers.
         """
         if self._paper or self._client is None:
             return True
 
-        def _beat() -> Any:
-            return self._client.post_heartbeat(self._hb_id)
+        def _beat() -> bool:
+            # New path first; fall back to the legacy path only if 404.
+            for path in ("/heartbeats", "/v1/heartbeats"):
+                headers = self._client._l2_headers("POST", path)
+                r = httpx.post(
+                    f"{self._cfg.wallet.clob_host}{path}",
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if r.status_code == 200:
+                    return True
+                if r.status_code != 404:
+                    break
+            return False
 
         try:
-            resp = await self._io(_beat)
-            new_id = _first(resp, "heartbeat_id", "heartbeatId", "id")
-            self._hb_id = str(new_id) if new_id else ""
+            ok = await self._io(_beat)
+            if not ok:
+                raise RuntimeError("heartbeat not acknowledged by exchange")
             if self._hb_failures:
                 log.info("heartbeat_recovered", after_failures=self._hb_failures)
             self._hb_failures = 0
             return True
         except Exception as exc:  # noqa: BLE001
             self._hb_failures += 1
-            self._hb_id = ""  # broken chain — restart it
             log.warning("heartbeat_failed", err=str(exc), consecutive=self._hb_failures)
             return False
 
@@ -528,3 +542,4 @@ def _first(d: Any, *keys: str) -> Any:
         if k in d and d[k]:
             return d[k]
     return None
+#（注：内容由AI生成）
