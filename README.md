@@ -86,9 +86,10 @@ Gamma     ─▶ Catalog/scanner ─▶ SQLite            periodic REST reconcil
 
 One async event loop. The strategy layer is a pure function `(book, inventory,
 params, clock) → TargetQuotes` — deterministic and unit-tested. The engine owns
-all I/O and state around it; the `ExecutionGateway` wraps `py-clob-client-v2`
-(which handles the V2 EIP-712 signing) and offloads its blocking calls to a
-thread pool so the hot path never stalls. State (positions, orders, PnL, catalog)
+all I/O and state around it; the `ExecutionGateway` wraps the unified
+`polymarket-client` SDK (which handles V2 EIP-712 signing, tick/fee resolution,
+wallet classification and Data API v2) and calls it directly on the event loop
+— no thread-pool offload needed. State (positions, orders, PnL, catalog)
 lives in one SQLite file; raw WS/order events are journaled to `journal/` for
 replay.
 
