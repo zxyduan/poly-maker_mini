@@ -140,8 +140,8 @@ async def _user_ws_auth(creds: Any, markets: list[str], proxy: str | None = None
         async with websockets.connect(USER_WS, **kw) as ws:
             await ws.send(json.dumps({
                 "type": "user",
-                "auth": {"apiKey": creds.api_key, "secret": creds.api_secret,
-                         "passphrase": creds.api_passphrase},
+                "auth": {"apiKey": creds.key, "secret": creds.secret,
+                         "passphrase": creds.passphrase},
                 "markets": markets,
             }))
             try:
@@ -175,14 +175,22 @@ async def _top_market_token(cfg: Config) -> str | None:
         return None
 
 
-def _extract_balance(ba: dict[str, Any]) -> float | None:
-    if not isinstance(ba, dict):
+def _extract_balance(ba: Any) -> float | None:
+    if isinstance(ba, dict):
+        for k in ("balance", "collateral", "amount"):
+            if k in ba:
+                try:
+                    v = float(ba[k])
+                    return v / 1e6 if v > 1e6 else v
+                except (ValueError, TypeError):
+                    return None
         return None
-    for k in ("balance", "collateral", "amount"):
-        if k in ba:
-            try:
-                v = float(ba[k])
-                return v / 1e6 if v > 1e6 else v
-            except (ValueError, TypeError):
-                return None
+    # unified SDK BalanceAllowance model: raw-unit int balance
+    bal = getattr(ba, "balance", None)
+    if bal is not None:
+        try:
+            v = float(bal)
+            return v / 1e6 if v > 1e6 else v
+        except (ValueError, TypeError):
+            return None
     return None

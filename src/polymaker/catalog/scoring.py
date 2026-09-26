@@ -47,7 +47,8 @@ def rebate_potential(m: MarketMeta) -> float:
     """Estimated daily maker-rebate POOL for the market, using the exact V2 fee
     formula (per-market rate + rebate rate, no hardcoding).
 
-    Per-share taker fee = fee_rate * p*(1-p)  (py_clob_client_v2/fees.py).
+    Per-share taker fee = fee_rate * p*(1-p)  (Polymarket V2 fee curve;
+    mirrored by the unified SDK's market model fee_schedule).
     Daily taker shares ~ vol_24h / mid, so:
         daily fees   = (vol/mid) * fee_rate * mid*(1-mid) = vol * fee_rate * (1-mid)
         rebate pool  = daily fees * rebate_rate

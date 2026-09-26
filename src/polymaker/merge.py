@@ -6,11 +6,12 @@ collateral (1 USDC/pUSD per pair) — a maker-only exit with zero market impact.
 Execution paths by wallet type (config.wallet.signature_type):
   * EOA (0):        direct contract call (`_merge_eoa`).
   * Gnosis Safe (2): wrapped in the Safe's `execTransaction`, owner eth_sign (`_merge_safe`).
-  * Polymarket V2 DepositWallet (1/3): `_merge_deposit_wallet` — the wallet's `execute()`
-    ONLY accepts calls from its factory (driven by Polymarket's relayer), so we sign an
-    EIP-712 batch (owner) and submit it via the builder relayer (gasless — relayer pays).
+  * Polymarket V2 DepositWallet (1/3): `_merge_deposit_wallet` — the unified SDK's
+    `merge_positions` builds the wallet's EIP-712 batch and submits it via the builder
+    relayer (gasless — relayer pays; authorized by the Builder API key).
     Verified live 2026-07-09 (LeBron neg-risk merge, tx 0x4d2a2064). Needs self-generated
-    builder API creds (clob.create_builder_api_key) in .env. See memory merge-deposit-wallet.
+    builder API creds (AsyncSecureClient.create_builder_api_key) in .env. See memory
+    merge-deposit-wallet.
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ class Merger:
     def can_merge(self) -> bool:
         """EOA (0) and Gnosis Safe (2) merge on-chain directly. The V2 DepositWallet
         (1/3) merges via the builder relayer — possible only when builder creds are
-        configured (self-generate once with clob.create_builder_api_key)."""
+        configured (self-generate once with AsyncSecureClient.create_builder_api_key)."""
         st = self._cfg.wallet.signature_type
         if st in (0, 2):
             return True
@@ -219,46 +220,57 @@ class Merger:
     def _merge_deposit_wallet(self, condition_id: str, amount_raw: int, neg_risk: bool) -> str:
         """Merge via Polymarket's V2 DepositWallet + builder relayer (gasless).
 
-        The wallet's execute() only accepts calls from its factory (driven by the
-        relayer), so we can't self-submit. Instead sign an EIP-712 batch (owner) with
-        the mergePositions call and POST it to the relayer, which submits on-chain and
-        pays the gas. Requests route through cfg.proxy (Polymarket geo-blocks). Verified
-        live 2026-07-09 (neg-risk merge, tx 0x4d2a2064)."""
+        The unified SDK's ``merge_positions`` builds the wallet batch (EIP-712,
+        owner) and POSTs it to the relayer using the Builder API key — the
+        relayer submits on-chain and pays the gas. This replaces the legacy
+        py_builder_relayer_client / py_builder_signing_sdk path. Requests route
+        through cfg.proxy (Polymarket geo-blocks). Verified live 2026-07-09
+        (neg-risk merge, tx 0x4d2a2064)."""
+        import asyncio
         import os
-        import time as _time
 
-        from py_builder_relayer_client.client import RelayClient
-        from py_builder_relayer_client.models import DepositWalletCall
-        from py_builder_signing_sdk.config import BuilderConfig
-        from py_builder_signing_sdk.sdk_types import BuilderApiKeyCreds
+        from polymarket import AsyncSecureClient, BuilderApiKey
 
-        self._ensure_web3()
-        w3, sec = self._w3, self._cfg.secrets
-        # the relayer client uses bare `requests`, which only honors a proxy via env vars
+        sec = self._cfg.secrets
+        # the unified SDK uses httpx, which honors standard proxy env vars
         if self._cfg.proxy:
             for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
                       "http_proxy", "https_proxy", "all_proxy"):
                 os.environ[k] = self._cfg.proxy
-        to, data = self._inner_merge_call(condition_id, amount_raw, neg_risk)
 
-        creds = BuilderApiKeyCreds(
-            key=sec.builder_key, secret=sec.builder_secret, passphrase=sec.builder_passphrase)
-        client = RelayClient(
-            sec.relayer_url, self._cfg.wallet.chain_id, private_key=sec.pk,
-            builder_config=BuilderConfig(local_builder_creds=creds))
-        signer = self._account.address
-        nonce = client.get_nonce(signer, "WALLET")["nonce"]
-        deadline = str(int(_time.time()) + 3600)
-        call = DepositWalletCall(target=w3.to_checksum_address(to), value="0", data=data)
-        resp = client.execute_deposit_wallet_batch(
-            [call], w3.to_checksum_address(sec.browser_address), nonce, deadline)
-        h = str(getattr(resp, "transaction_hash", None) or getattr(resp, "hash", None))
-        receipt = w3.eth.wait_for_transaction_receipt(h, timeout=180)
-        status = receipt.get("status", 1)
+        async def _run() -> str:
+            try:
+                client = await AsyncSecureClient.create(
+                    private_key=sec.pk,
+                    api_key=BuilderApiKey(
+                        key=sec.builder_key or "",
+                        secret=sec.builder_secret or "",
+                        passphrase=sec.builder_passphrase or "",
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 - keep context for live ops
+                log.error(
+                    "merge_client_bootstrap_failed",
+                    err=str(exc),
+                    condition=condition_id[:12],
+                    note="AsyncSecureClient.create with BuilderApiKey (gasless path)",
+                )
+                raise
+            try:
+                log.info("merge_positions_submitting", condition=condition_id[:12],
+                         amount=amount_raw, sig_type=self._cfg.wallet.signature_type)
+                # wait() raises on a failed (reverted) or timed-out tx
+                handle = await client.merge_positions(
+                    condition_id=condition_id, amount=amount_raw
+                )
+                await handle.wait()
+                return str(handle.transaction_hash)
+            finally:
+                await client.close()
+
+        h = asyncio.run(_run())
         log.info("merge_sent_deposit_wallet", condition=condition_id[:12],
-                 amount=amount_raw, tx=h[:14], status=status)
-        if status != 1:
-            raise RuntimeError(f"deposit-wallet merge reverted: {h}")
+                 amount=amount_raw, tx=h[:14])
         return h
 
 

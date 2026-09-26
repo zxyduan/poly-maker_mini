@@ -18,6 +18,7 @@ from rich.console import Console
 from polymaker.config import Config
 from polymaker.domain import Quote, Side
 from polymaker.execution.gateway import ExecutionGateway
+from polymaker.strategy.quoting import round_to_tick
 
 
 async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0) -> bool:
@@ -61,9 +62,13 @@ async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0
     console.print(f"  balance/allowance: {ba}")
 
     # a deep resting price: well below best bid, snapped to tick, floored at 2 ticks
+    dec = meta.price_decimals
     tick = meta.tick_size
     best_bid = meta.best_bid or 0.30
-    price = max(2 * tick, round((best_bid - 0.10) / tick) * tick)
+    price = max(
+    round_to_tick(2 * tick, tick, dec, up=False),          # 地板 2 ticks
+    round_to_tick(best_bid - 0.10, tick, dec, up=False),   # 深价买单，干净网格
+    )
     size = round(max(meta.min_order_size, notional_usdc / price), 2)
     console.print(f"  placing post-only BUY {size} @ {price} on YES token "
                   f"(~${price * size:.2f}, deep — will not fill)")

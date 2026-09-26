@@ -57,6 +57,16 @@ class UserStream:
         self._markets = condition_ids
 
     async def run(self) -> None:
+        # Fail fast instead of retrying forever: userstream needs the L2 creds
+        # that gateway.connect() derives (unified SDK ApiKeyCreds: key/secret/
+        # passphrase). If they are missing, order/trade events never arrive and
+        # the engine would run blind.
+        if not self._creds or not getattr(self._creds, "key", ""):
+            log.error(
+                "user_ws_no_creds",
+                note="gateway.connect() must run before userstream starts",
+            )
+            return
         backoff = 1.0
         while not self._stop.is_set():
             try:
@@ -75,9 +85,10 @@ class UserStream:
         sub = {
             "type": "user",
             "auth": {
-                "apiKey": self._creds.api_key,
-                "secret": self._creds.api_secret,
-                "passphrase": self._creds.api_passphrase,
+                # unified SDK ApiKeyCreds: key / secret / passphrase
+                "apiKey": self._creds.key,
+                "secret": self._creds.secret,
+                "passphrase": self._creds.passphrase,
             },
             "markets": self._markets,
         }

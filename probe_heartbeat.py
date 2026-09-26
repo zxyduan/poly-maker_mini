@@ -15,6 +15,7 @@ Exit code: 0 = at least one path acknowledged; 1 = none; 2 = no credentials.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -22,6 +23,7 @@ from pathlib import Path
 import httpx
 
 from polymaker.config import Config
+from polymaker.l2auth import l2_headers
 
 _MASK_HEADERS = {"POLY_API_KEY", "POLY_PASSPHRASE", "POLY_SIGNATURE"}
 
@@ -45,8 +47,9 @@ def _pick_config_dir(default: str) -> Path:
 
 
 def probe(path: str, client: object, host: str) -> bool:
-    # Reuse the SDK's own L2 signing (same headers gateway.heartbeat() sends).
-    headers = client._l2_headers("POST", path)  # noqa: SLF001
+    # Reuse the unified SDK's L2 signing (same headers gateway.heartbeat()
+    # sends — built by polymaker.l2auth from the SDK credentials).
+    headers = l2_headers(client, "POST", path)
     url = f"{host}{path}"
     print("\n" + "=" * 76)
     print(f"[REQUEST] POST {url}")
@@ -66,7 +69,7 @@ def probe(path: str, client: object, host: str) -> bool:
     return r.status_code == 200
 
 
-def main() -> int:
+async def main() -> int:
     ap = argparse.ArgumentParser(description="Probe Polymarket heartbeat endpoints")
     ap.add_argument("--config-dir", default="livecfg",
                     help="config dir with config.toml (default: livecfg)")
@@ -80,33 +83,31 @@ def main() -> int:
               "next to the config dir, then rerun.")
         return 2
 
-    from py_clob_client_v2.client import ClobClient
+    from polymarket import AsyncSecureClient
 
-    client = ClobClient(
-        host=cfg.wallet.clob_host,
-        chain_id=cfg.wallet.chain_id,
-        key=sec.pk,
-        signature_type=cfg.wallet.signature_type,
-        funder=sec.browser_address,
+    client = await AsyncSecureClient.create(
+        private_key=sec.pk,
+        wallet=sec.browser_address,
     )
-    creds = client.create_or_derive_api_key()
-    client.set_api_creds(creds)
 
-    print(f"signer EOA : {client.get_address()}")
+    print(f"signer EOA : {client.signer}")
     print(f"funder     : {sec.browser_address}")
     print(f"sig_type   : {cfg.wallet.signature_type}  host: {cfg.wallet.clob_host}")
 
-    paths = ("/heartbeats", "/v1/heartbeats")
-    ok = [p for p in paths if probe(p, client, cfg.wallet.clob_host)]
-    print("\n" + "=" * 76)
-    if ok:
-        print(f"VERDICT: acknowledged on {ok} -> gateway.heartbeat() already "
-              f"tries {ok[0]} first, so the bot is on the right path.")
-        return 0
-    print("VERDICT: no path acknowledged (all non-200). Check creds/network.")
-    return 1
+    try:
+        paths = ("/heartbeats", "/v1/heartbeats")
+        ok = [p for p in paths if probe(p, client, cfg.wallet.clob_host)]
+        print("\n" + "=" * 76)
+        if ok:
+            print(f"VERDICT: acknowledged on {ok} -> gateway.heartbeat() already "
+                  f"tries {ok[0]} first, so the bot is on the right path.")
+            return 0
+        print("VERDICT: no path acknowledged (all non-200). Check creds/network.")
+        return 1
+    finally:
+        await client.close()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(asyncio.run(main()))
 #（注：内容由AI生成）

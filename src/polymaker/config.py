@@ -153,7 +153,6 @@ class StrategyProfile(BaseModel):
     ow_edge_base_ticks: int = 5
     # 单边策略的再报价 tick 阈值（本地策略新增字段，配置里可覆盖）
     ow_reprice_ticks: int = 1
-    ow_idle_seconds: float = 21600.0
     # 卖盘无墙（盘口稀薄）时，持仓分几档价位出
     ow_sell_split_levels: int = 3
     # 阴跌三级刹车线（库存利用率 u = 持仓/q_max）
@@ -219,9 +218,11 @@ class Secrets(BaseSettings):
     browser_address: str = Field(default="", alias="BROWSER_ADDRESS")
     polygon_rpc: str | None = Field(default=None, alias="POLYGON_RPC")
     alert_webhook_url: str | None = Field(default=None, alias="ALERT_WEBHOOK_URL")
-    # Polymarket builder API creds (self-generated via L2 auth: clob.create_builder_api_key)
-    # + relayer URL — needed to merge a V2 DepositWallet (sig_type 1/3), whose execute()
-    # only accepts calls from its factory/relayer. See merge.py.
+    # Polymarket builder API creds (self-generated via the unified SDK:
+    # AsyncSecureClient.create_builder_api_key). Needed to merge a V2
+    # DepositWallet (sig_type 1/3) gaslessly via the relayer. See merge.py.
+    # relayer_url is kept for config compatibility; the unified SDK uses its
+    # own relayer endpoint.
     builder_key: str | None = Field(default=None, alias="POLY_BUILDER_KEY")
     builder_secret: str | None = Field(default=None, alias="POLY_BUILDER_SECRET")
     builder_passphrase: str | None = Field(default=None, alias="POLY_BUILDER_PASSPHRASE")

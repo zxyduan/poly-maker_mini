@@ -98,12 +98,7 @@ class UserEventProcessor:
                 self._on_change(condition_id)
 
     def on_order(self, ev: OrderEvent, condition_id: str) -> None:
-        log.info("ws_order_event", cid=condition_id[:8], oid=ev.order_id[:10],
-                 side=ev.side, price=ev.price, remaining=ev.remaining_size,
-                 cancel=ev.is_cancel)
         if ev.is_cancel or ev.remaining_size <= 0:
-            log.warning("ws_order_removed", cid=condition_id[:8], oid=ev.order_id[:10],
-                        cancel=ev.is_cancel, remaining=ev.remaining_size)
             self._store.remove_order(ev.order_id)
         else:
             state = OrderState.LIVE

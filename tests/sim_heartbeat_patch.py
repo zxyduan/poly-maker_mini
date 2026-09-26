@@ -1,27 +1,23 @@
 """Standalone verification of the patched ExecutionGateway.heartbeat().
 
 Simulates the three live-mode branches (200 ack, 404->fallback, 400 reject)
-with a fake client and a monkeypatched httpx.post; no network involved.
+with a fake client and a monkeypatched httpx.post + gateway.l2_headers;
+no network involved.
 """
 
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 from polymaker.config import Config
 from polymaker.execution import gateway as gw_mod
 
 
 class FakeClient:
-    """Minimal stand-in for py_clob_client_v2.ClobClient (L2 headers only)."""
+    """Minimal stand-in for the unified SDK client (records header signings)."""
 
     def __init__(self) -> None:
         self.called_paths: list[str] = []
-
-    def _l2_headers(self, method: str, path: str) -> dict[str, str]:
-        self.called_paths.append(path)
-        return {"POLY_ADDRESS": "0xabc", "POLY_SIGNATURE": "sig"}
 
 
 class FakeResp:
@@ -37,8 +33,19 @@ def make_gw() -> tuple[gw_mod.ExecutionGateway, FakeClient]:
     return gw, client
 
 
+def install_fake_l2(gw_mod: object, client: FakeClient) -> None:
+    """Patch gateway's l2_headers to record the requested path."""
+
+    def fake_l2(client_: object, method: str, path: str, body: str | None = None) -> dict[str, str]:
+        client.called_paths.append(path)
+        return {"POLY_ADDRESS": "0xabc", "POLY_SIGNATURE": "sig"}
+
+    gw_mod.l2_headers = fake_l2  # type: ignore[attr-defined]
+
+
 def test_200_ack() -> None:
     gw, client = make_gw()
+    install_fake_l2(gw_mod, client)
     responses = iter([FakeResp(200)])
 
     def fake_post(url: str, headers=None, timeout=None) -> FakeResp:
@@ -54,6 +61,7 @@ def test_200_ack() -> None:
 
 def test_404_fallback() -> None:
     gw, client = make_gw()
+    install_fake_l2(gw_mod, client)
     responses = iter([FakeResp(404), FakeResp(200)])
 
     def fake_post(url: str, headers=None, timeout=None) -> FakeResp:
@@ -69,6 +77,7 @@ def test_404_fallback() -> None:
 
 def test_400_reject_counts_failure() -> None:
     gw, client = make_gw()
+    install_fake_l2(gw_mod, client)
     responses = iter([FakeResp(400)])
 
     def fake_post(url: str, headers=None, timeout=None) -> FakeResp:
@@ -96,4 +105,3 @@ if __name__ == "__main__":
     test_400_reject_counts_failure()
     test_paper_noop()
     print("ALL HEARTBEAT SIMULATIONS PASSED")
-#（注：内容由AI生成）
