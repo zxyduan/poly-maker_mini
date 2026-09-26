@@ -153,6 +153,7 @@ class StrategyProfile(BaseModel):
     ow_edge_base_ticks: int = 5
     # 单边策略的再报价 tick 阈值（本地策略新增字段，配置里可覆盖）
     ow_reprice_ticks: int = 1
+    ow_idle_seconds: float = 21600.0
     # 卖盘无墙（盘口稀薄）时，持仓分几档价位出
     ow_sell_split_levels: int = 3
     # 阴跌三级刹车线（库存利用率 u = 持仓/q_max）
