@@ -21,7 +21,7 @@ import itertools
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, TypeVar
 
 import httpx
@@ -205,15 +205,18 @@ class ExecutionGateway:
             log.warning("clock_check_failed", err=str(exc))
 
     # ── placement ───────────────────────────────────────────────────────
-    async def place(self, quotes: list[Quote], meta: MarketMeta) -> list[OpenOrder]:
+    async def place(self, quotes: list[Quote], meta: MarketMeta) -> tuple[list[OpenOrder], list[PlaceReject]]:
+        """Place a batch. Returns (placed, rejected); `rejected` carries a
+        machine-readable category so the engine can tell state-skew rejections
+        (balance) and transient ones (rate) from real bugs (price/other)."""
         if not quotes:
-            return []
+            return [], []
         await self._order_bucket.acquire(len(quotes))
         ts = time.time()
         self._journal_write("orders_out", [asdict(q) for q in quotes], ts)
 
         if self._paper:
-            return [self._paper_order(q) for q in quotes]
+            return [self._paper_order(q) for q in quotes], []
 
         # The unified SDK resolves tick size / neg-risk / fees / signing per
         # order; post-only is a per-order flag (maker-only mandate).
@@ -238,15 +241,20 @@ class ExecutionGateway:
                 token_ids=[q.token_id[:12] for q in quotes],
                 post_only=self._cfg.execution.post_only,
             )
-            return []
+            return [], []
 
     def _paper_order(self, q: Quote) -> OpenOrder:
         oid = f"paper-{next(self._paper_ids)}"
         return OpenOrder(oid, q.token_id, q.side, q.price, q.size, OrderState.LIVE)
 
-    def _parse_place_response(self, resp: Any, quotes: list[Quote]) -> list[OpenOrder]:
-        """Map a batch post response to OpenOrders. Tolerant of shape variants;
-        the user-WS order events + REST snapshot reconcile anything we miss."""
+    def _parse_place_response(
+        self, resp: Any, quotes: list[Quote]
+    ) -> tuple[list[OpenOrder], list[PlaceReject]]:
+        """Map a batch post response to (placed, rejected). Tolerant of shape
+        variants; the user-WS order events + REST snapshot reconcile anything
+        we miss. Rejections are categorised so a stale-state 'not enough
+        balance' (the common race after a fill the user-WS hasn't delivered
+        yet) is NOT treated as a code bug."""
         log.info(
             "place_resp",
             resp=str(resp)[:500],
@@ -263,18 +271,45 @@ class ExecutionGateway:
             items = resp
         else:
             items = []
-        out: list[OpenOrder] = []
+        placed: list[OpenOrder] = []
+        rejected: list[PlaceReject] = []
         for q, item in zip(quotes, items, strict=False):
             if isinstance(item, dict):
                 oid = _first(item, "orderID", "orderId", "order_id", "id", "hash")
-                err = str(item.get("message", item.get("error", "")))
+                err = str(
+                    item.get("errorMsg")
+                    or item.get("message")
+                    or item.get("error")
+                    or ""
+                )
             else:
                 oid = getattr(item, "order_id", None)
                 ok = getattr(item, "ok", True)
-                err = str(getattr(item, "message", getattr(item, "code", "")))
+                err = str(
+                    getattr(item, "message", "") or getattr(item, "errorMsg", "") or ""
+                )
                 if not ok:
-                    err = err or getattr(item, "code", "")
+                    err = err or str(getattr(item, "code", ""))
+            if err and err not in ("", "None"):
+                category = _reject_category(err)
+                rejected.append(PlaceReject(q.side, q.price, q.size, category, err[:200]))
+                log.warning(
+                    "order_rejected",
+                    oid=str(oid)[:16] if oid else "",
+                    err=err[:200],
+                    category=category,
+                    side=q.side.value,
+                    price=q.price,
+                    size=q.size,
+                )
+                continue
             if not oid:
+                # No id and no error message — an anomalous shape; be
+                # conservative: never track a phantom order, surface as an
+                # 'other' rejection so the engine quarantines and resyncs.
+                rejected.append(
+                    PlaceReject(q.side, q.price, q.size, "other", "no order id in response")
+                )
                 log.warning(
                     "place_response_missing_id",
                     item=str(item)[:200],
@@ -283,18 +318,8 @@ class ExecutionGateway:
                     size=q.size,
                 )
                 continue
-            if err and err not in ("", "None"):
-                log.warning(
-                    "order_rejected",
-                    oid=str(oid)[:16],
-                    err=err[:200],
-                    side=q.side.value,
-                    price=q.price,
-                    size=q.size,
-                )
-                continue
-            out.append(OpenOrder(str(oid), q.token_id, q.side, q.price, q.size, OrderState.LIVE))
-        return out
+            placed.append(OpenOrder(str(oid), q.token_id, q.side, q.price, q.size, OrderState.LIVE))
+        return placed, rejected
 
     # ── cancellation ────────────────────────────────────────────────────
     async def cancel(self, order_ids: list[str]) -> bool:
@@ -661,6 +686,37 @@ def _first(d: Any, *keys: str) -> Any:
         if k in d and d[k]:
             return d[k]
     return None
+
+
+def _reject_category(msg: str) -> str:
+    """Classify a CLOB rejection message so the engine can decide whether it
+    is a code bug (price/other -> counts toward the error-rate kill switch),
+    a transient limit (rate -> warn only) or stale local state (balance ->
+    resync instead of halt)."""
+    m = msg.lower()
+    if "not enough balance" in m or ("balance" in m and "allowance" in m):
+        return "balance"
+    if "tick" in m or "price" in m:
+        return "price"
+    if "rate" in m or "throttl" in m:
+        return "rate"
+    return "other"
+
+
+@dataclass(frozen=True, slots=True)
+class PlaceReject:
+    """One rejected order from a batch place, with a machine-readable reason.
+
+    category: ``balance`` (stale local state — resync, never halt),
+    ``price`` / ``other`` (code/logic bug — count toward error rate),
+    ``rate`` (transient limit — warn only).
+    """
+
+    side: Side
+    price: float
+    size: float
+    category: str
+    msg: str
 
 
 # （注：内容由AI生成）

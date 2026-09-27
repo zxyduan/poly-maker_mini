@@ -145,7 +145,7 @@ async def test_place_failure_triggers_quarantine(tmp_path, meta):
     cancelled_assets: list[str] = []
 
     async def failing_place(quotes, m):  # posts may or may not have landed
-        return []
+        return [], []
 
     async def spy_cancel_asset(asset_id):
         cancelled_assets.append(asset_id)
@@ -177,7 +177,7 @@ async def test_cancel_failure_keeps_orders_and_skips_placement(tmp_path, meta):
 
     async def spy_place(quotes, m):
         placed_calls.append(len(quotes))
-        return []
+        return [], []
 
     async def rest_still_live():  # REST confirms the order is still on the book
         return [stale]

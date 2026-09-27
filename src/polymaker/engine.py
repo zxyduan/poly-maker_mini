@@ -514,16 +514,41 @@ class Engine:
                 log.warning("shed_load", cid=cid[:8], pressure=round(self.gateway.order_pressure, 2))
                 self._dirty[cid].set()  # retry soon
             else:
-                placed = await self.gateway.place(plan.to_place, meta)
+                placed, rejected = await self.gateway.place(plan.to_place, meta)
                 placed_n = len(placed)
-                self.risk.note_order_result(len(placed) == len(plan.to_place))
+                # Only genuine code bugs (price/other) count toward the error-
+                # rate kill switch. 'balance' = stale local state (a fill the
+                # user-WS hasn't delivered yet) — resync, never halt. 'rate' =
+                # transient throttle — warn only.
+                code_err = [r for r in rejected if r.category in ("price", "other")]
+                self.risk.note_order_result(not code_err)
                 for o in placed:
                     self.state.upsert_order(o)
                 if len(placed) < len(plan.to_place):
-                    # QUARANTINE: a failed/partial batch may still have posted
-                    # orders we don't have ids for. Cancel everything on these
-                    # tokens (idempotent) and resync — never risk an untracked order.
-                    await self._quarantine(meta, reason="place_incomplete")
+                    bal = [r for r in rejected if r.category == "balance"]
+                    if bal:
+                        # Sell rested on shares that a fill just consumed: the
+                        # local `held` is stale. Fix from REST immediately and
+                        # requote with the corrected state — no quarantine (the
+                        # rejected order never existed server-side) and no halt.
+                        log.warning(
+                            "place_rejected_balance",
+                            cid=cid[:8],
+                            n=len(bal),
+                            held=round(pos_yes.size, 2),
+                            msg=bal[0].msg,
+                        )
+                        with contextlib.suppress(Exception):
+                            positions = self._only_traded(await self.gateway.positions())
+                            if positions:
+                                self.state.reconcile_positions(positions)
+                            await self._refresh_token_orders(meta, grace_s=0.0)
+                        self._dirty[cid].set()
+                    else:
+                        # QUARANTINE: a failed/partial batch may still have posted
+                        # orders we don't have ids for. Cancel everything on these
+                        # tokens (idempotent) and resync — never risk an untracked order.
+                        await self._quarantine(meta, reason="place_incomplete")
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),

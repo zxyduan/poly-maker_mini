@@ -74,7 +74,7 @@ async def run_moneydoctor(cfg: Config, console: Console, notional_usdc: float | 
     # ── 1. LIMIT: rest + cancel ─────────────────────────────────────────
     limit_price = round_to_tick(best_bid - 2 * tick, tick, dec, up=False)
     limit_size = max(meta.min_order_size, 5.0)
-    placed = await gw.place([Quote(token, Side.BUY, limit_price, limit_size)], meta)
+    placed, _rejected = await gw.place([Quote(token, Side.BUY, limit_price, limit_size)], meta)
     if placed:
         await asyncio.sleep(1.5)
         live = await gw.open_orders()

@@ -61,19 +61,21 @@ async def run_livetest(cfg: Config, console: Console, notional_usdc: float = 5.0
     ba = await gw.balance_allowance()
     console.print(f"  balance/allowance: {ba}")
 
-    # a deep resting price: well below best bid, snapped to tick, floored at 2 ticks
-    dec = meta.price_decimals
+    # a deep resting price: well below best bid, snapped to the tick grid,
+    # floored at 2 ticks. round_to_tick kills float noise (0.47000000000000003)
+    # that the unified SDK's strict price validation rejects.
     tick = meta.tick_size
+    dec = meta.price_decimals
     best_bid = meta.best_bid or 0.30
     price = max(
-    round_to_tick(2 * tick, tick, dec, up=False),          # 地板 2 ticks
-    round_to_tick(best_bid - 0.10, tick, dec, up=False),   # 深价买单，干净网格
+        round_to_tick(2 * tick, tick, dec, up=False),
+        round_to_tick(best_bid - 0.10, tick, dec, up=False),
     )
     size = round(max(meta.min_order_size, notional_usdc / price), 2)
     console.print(f"  placing post-only BUY {size} @ {price} on YES token "
                   f"(~${price * size:.2f}, deep — will not fill)")
 
-    placed = await gw.place([Quote(meta.yes.token_id, Side.BUY, price, size)], meta)
+    placed, _rejected = await gw.place([Quote(meta.yes.token_id, Side.BUY, price, size)], meta)
     if not placed:
         console.print("  [red]✗ order not placed (see logs for the API error)[/red]")
         return False
