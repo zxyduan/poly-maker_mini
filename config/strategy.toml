@@ -85,3 +85,22 @@ halt_before_hours   = 2
 # --- exits ---
 exit_urgency_s      = 900
 merge_min_size      = 20.0
+
+
+# one_way_mm v0.5: BUY YES 单边金字塔，贴 touch 小、深处大，锚大单墙后挂
+[profiles.one_way]A
+type                = "one_way"
+base_size_usdc      = 10.0
+q_max_usdc          = 20
+layer_step_ticks    = 5
+ow_side             = "yes"
+ow_pyramid_shares   = [0.10, 0.20, 0.30, 0.40]
+ow_wall_pct_of_24h  = 0.005
+ow_wall_skip_ticks  = 1
+ow_wall_min_gap_ticks = 5
+ow_edge_base_ticks  = 1
+ow_inv_low          = 0.33
+ow_inv_mid          = 0.66
+ow_panic_toxicity   = 0.6
+ow_exit_days_before = 30.0
+ow_reprice_ticks    = 1

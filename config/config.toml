@@ -17,7 +17,6 @@ chain_id = 137
 signature_type = 3
 clob_host = "https://clob.polymarket.com"
 gamma_host = "https://gamma-api.polymarket.com"
-data_api_host = "https://data-api.polymarket.com"
 polygon_rpc = "https://polygon-bor-rpc.publicnode.com"
 
 [engine]

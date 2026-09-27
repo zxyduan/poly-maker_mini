@@ -2,7 +2,7 @@
 
 > 依据官方「从旧版 SDK 迁移到统一 SDK - Polymarket Documentation」完成
 > （附在 `docs/polymarket-docs/`，含 Data API v1→v2 文档）。
-> 迁移 commit：`3f06deb`；日志增强 commit：见 `git log`。
+> 迁移 commit：`73b7cb3`（v2 主体）+ `7f787e0`（收尾/测试）；日志增强 commit：见 `git log`。
 
 ## 1. 依赖变更
 
@@ -102,7 +102,23 @@ mypy 的 `ignore_missing_imports` 覆盖已同步调整（SDK 自带类型标注
 
 ## 6. 验证方式
 
-- `uv run pytest -q --ignore=tests/test_scanner.py` → 112 passed, 2 skipped（跳过为网络 live 测试）
+- `uv run pytest -q`（含 test_scanner，`97026a5` 已补 ScanSettings）→ 149 passed, 2 skipped
 - `uv run python tests/sim_heartbeat_patch.py` → 4/4 通过
-- `uv run ruff check`（迁移触及文件）→ 0 错误
-- `uv run mypy src/polymaker`（迁移触及文件）→ 0 错误
+- `uv run ruff check`（迁移触及文件）→ 0 错误（全仓 26 条历史告警，见 §5）
+- `uv run mypy src/polymaker`（迁移触及文件）→ 0 错误（全仓 21 个历史错误，见 §5）
+
+## 7. 迁移后清理（本次）
+
+- 删除死配置 `wallet.data_api_host`（`config.py` / `config.toml` / `livecfg/config.toml`）与
+  gateway 中未再使用的 `self._data_host`——持仓读取已统一走 SDK `list_positions`（Data API v2），
+  不再直连 data-api。
+- `query_rewards.py` 仍是独立奖励扫描脚本（裸 httpx 打 Gamma/CLOB/incentives），不在实盘交易链路，
+  保持原样；如后续要统一到 SDK，可把 `/sampling-markets` 换成 `list_current_rewards()`。
+
+## 8. 拒单分类逻辑（已恢复）
+
+- `97026a5` 曾把 engine.py 的 `gateway.place()` 调用改成单值接收 `placed = ...`，但 gateway 仍返回
+  元组 `(placed, rejected)`，导致 7 个 engine/hardening 测试报 `AttributeError: 'list' object has no
+  attribute 'state'`。已恢复为 `placed, rejected = ...` 并重新接上拒单分类：`price/other` 计入错误率
+  kill switch，`balance`（本地持仓因未送达 fill 而过时）走 REST 快速重对账、不 quarantine 不 halt，
+  其余失败才 quarantine。修复后全量测试 149 passed, 2 skipped。

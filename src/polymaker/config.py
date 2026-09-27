@@ -28,7 +28,6 @@ class WalletConfig(BaseModel):
     signature_type: int = 2
     clob_host: str = "https://clob.polymarket.com"
     gamma_host: str = "https://gamma-api.polymarket.com"
-    data_api_host: str = "https://data-api.polymarket.com"
     polygon_rpc: str = "https://polygon-bor-rpc.publicnode.com"
 
 

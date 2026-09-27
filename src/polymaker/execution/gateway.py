@@ -53,7 +53,6 @@ class ExecutionGateway:
         self._creds: Any = None  # ApiKeyCreds (key/secret/passphrase)
         self._address: str = ""  # signer EOA
         self._funder: str = ""  # funds/positions live here (proxy/deposit wallet)
-        self._data_host = cfg.wallet.data_api_host
         # rate budgets: fraction of documented POST/DELETE ceilings (per second)
         f = cfg.execution.rate_budget_fraction
         self._order_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
