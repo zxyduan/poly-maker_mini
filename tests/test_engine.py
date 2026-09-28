@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 
-from polymaker.config import Config, PathsConfig, StrategyProfile
+from polymaker.config import Config, PathsConfig
+from polymaker.config import MakerProfile as StrategyProfile
 from polymaker.domain import Side
 from polymaker.engine import Engine
+from polymaker.strategy import get_strategy
 from polymaker.strategy.regime import RegimeMachine
 
 
@@ -19,9 +21,11 @@ def _engine_with_market(tmp_path, meta) -> Engine:
     eng = Engine(cfg, paper=True)
     cid = meta.condition_id
     # inject one market directly, bypassing network resolution
+    prof = StrategyProfile()
     eng.metas[cid] = meta
-    eng.profiles[cid] = StrategyProfile()
-    eng.est[cid] = Engine._make_estimators(eng.profiles[cid])
+    eng.profiles[cid] = prof
+    eng.strategy_fn[cid] = get_strategy(prof.type)
+    eng.est[cid] = Engine._make_estimators(prof)
     eng.regime_m[cid] = RegimeMachine()
     eng._dirty[cid] = asyncio.Event()
     eng._locks[cid] = asyncio.Lock()

@@ -5,13 +5,13 @@ from __future__ import annotations
 import pytest
 
 from polymaker.domain import Position, Regime, Side
+from polymaker.strategy.base import StrategyInputs
 from polymaker.strategy.quoting import (
-    QuoteInputs,
     compute_fair_value,
     construct_quotes,
     round_to_tick,
 )
-from tests.conftest import view
+from tests.conftest import book
 
 
 def _inputs(meta, profile, **over):
@@ -21,15 +21,15 @@ def _inputs(meta, profile, **over):
         fv=0.50,
         vol_short=0.0,
         toxicity=0.0,
-        yes_view=view(0.49, 0.51),
-        no_view=view(0.49, 0.51),
+        yes_book=book(0.49, 0.51),
+        no_book=book(0.49, 0.51),
         pos_yes=Position("yes-token"),
         pos_no=Position("no-token"),
         profile=profile,
         now=1000.0,
     )
     base.update(over)
-    return QuoteInputs(**base)
+    return StrategyInputs(**base)
 
 
 # ── round_to_tick ──────────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ def test_exit_never_below_best_bid(meta, profile):
         _inputs(
             meta, profile,
             pos_yes=Position("yes-token", 100, 0.4),
-            yes_view=view(0.49, 0.51),
+            yes_book=book(0.49, 0.51),
             yes_exit_urgency=1.0,  # maximally urgent
         )
     )

@@ -30,6 +30,19 @@ def test_hmac_matches_unified_sdk() -> None:
         assert ours == theirs, (secret, method, path)
 
 
+def test_hmac_golden_vector() -> None:
+    """A fixed input must produce a fixed output, independent of whether the SDK
+    is installed. Guards against silent drift if the SDK's own signing changes.
+    """
+    sig = hmac_signature(
+        secret="c2VjcmV0LWtleS1mb3ItdGVzdA==",
+        timestamp=1700000000,
+        method="POST",
+        path="/heartbeats",
+    )
+    assert sig == "V3eeuQE2_JySUdTq4r5yEAWzmIi6QK2XxQXWvEEqG7U="
+
+
 def test_l2_headers_shape() -> None:
     from types import SimpleNamespace
 

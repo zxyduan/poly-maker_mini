@@ -31,13 +31,15 @@ from polymaker.merge import Merger
 from polymaker.risk.manager import RiskManager
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
+from polymaker.strategy import get_strategy
+from polymaker.strategy.base import StrategyFn, StrategyInputs
 from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
+from polymaker.strategy.quoting import compute_fair_value
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
 
@@ -68,6 +70,7 @@ class Engine:
         # per-market state
         self.metas: dict[str, MarketMeta] = {}
         self.profiles: dict[str, StrategyProfile] = {}
+        self.strategy_fn: dict[str, StrategyFn] = {}
         self.est: dict[str, MarketEstimators] = {}
         self.regime_m: dict[str, RegimeMachine] = {}
         self._dirty: dict[str, asyncio.Event] = {}
@@ -187,8 +190,12 @@ class Engine:
                     log.warning("market_unresolved", ref=entry.ref)
                     continue
                 self.metas[meta.condition_id] = meta
-                self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
-                self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
+                prof = self.cfg.profile_for(entry)
+                self.profiles[meta.condition_id] = prof
+                # Resolve the strategy function once at startup; an unknown type
+                # raises here (fail fast) rather than on the first quoter tick.
+                self.strategy_fn[meta.condition_id] = get_strategy(prof.type)
+                self.est[meta.condition_id] = self._make_estimators(prof)
                 self.regime_m[meta.condition_id] = RegimeMachine()
                 self._dirty[meta.condition_id] = asyncio.Event()
                 self._locks[meta.condition_id] = asyncio.Lock()
@@ -199,17 +206,21 @@ class Engine:
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
         reward_rates: dict[str, float],
     ) -> MarketMeta | None:
-        tag_id = self.catalog.cached_tag("politics")
-        if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
-            tag_id = await gamma.resolve_tag_id("politics")
-            if tag_id:
-                self.catalog.cache_tag("politics", tag_id)
-        async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
-            if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
-                m = parse_market(raw, reward_rates)
-                if m:
-                    self.catalog.upsert_market(m)
-                return m
+        # Search the configured scan tags (not a hardcoded "politics"); fall back
+        # to politics only when no tags are configured, preserving old behavior.
+        tag_slugs = tuple(self.cfg.scan.tag_slugs) or ("politics",)
+        for tag in tag_slugs:
+            tag_id = self.catalog.cached_tag(tag)
+            if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
+                tag_id = await gamma.resolve_tag_id(tag)
+                if tag_id:
+                    self.catalog.cache_tag(tag, tag_id)
+            async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
+                if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
+                    m = parse_market(raw, reward_rates)
+                    if m:
+                        self.catalog.upsert_market(m)
+                    return m
         return None
 
     @staticmethod
@@ -444,36 +455,28 @@ class Engine:
             p,
         )
 
-        if getattr(p, "type", "maker") == "one_way":
-            # 延迟导入：单边做市按需加载，不影响其他策略启动
-            from polymaker.strategy.one_way import construct_one_way_quotes
-            tq = construct_one_way_quotes(
-                meta=meta,
-                profile=p,
-                yes_book=yes_book,
-                no_book=no_book,
-                now=now,
-                fv=fv,
-                vol_short=est.vol.short,
-                toxicity=est.markout.toxicity,
-                pos_yes=pos_yes,
-                risk_size_scale=rd.size_scale,
-                hours_to_end=hours_to_end,
-            )
-        else:
-            # 原有双边做市逻辑（完全不动）
-            tq = construct_quotes(QuoteInputs(
-                meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
-                toxicity=est.markout.toxicity, yes_view=yes_book.view(),
-                no_view=(no_book.view() if no_book else _empty_view()),
-                pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
-                risk_size_scale=rd.size_scale,
-            ))
+        # Strategy dispatch: the function was resolved once at startup from
+        # profile.type. The engine knows nothing about per-strategy knobs here.
+        inp = StrategyInputs(
+            meta=meta,
+            profile=p,
+            yes_book=yes_book,
+            no_book=no_book,
+            now=now,
+            fv=fv,
+            vol_short=est.vol.short,
+            toxicity=est.markout.toxicity,
+            pos_yes=pos_yes,
+            pos_no=pos_no,
+            risk_size_scale=rd.size_scale,
+            hours_to_end=hours_to_end,
+            regime=regime,
+        )
+        tq = self.strategy_fn[cid](inp)
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
-        rpt = p.ow_reprice_ticks if p.type == "one_way" else p.reprice_ticks
         plan = reconcile(tq, live, tick=meta.tick_size,
-                         reprice_ticks=rpt, resize_frac=p.resize_frac)
+                         reprice_ticks=p.reprice_ticks, resize_frac=p.resize_frac)
         if plan.is_noop:
             self._maybe_merge(cid, meta, p, pos_yes.size, pos_no.size)
             return
@@ -832,9 +835,3 @@ def _hours_to_end(end_date_iso: str | None, now: float) -> float | None:
         return hrs if hrs > 0.0 else None
     except (ValueError, TypeError):
         return None
-
-
-def _empty_view() -> Any:
-    from polymaker.marketdata.orderbook import BookView
-
-    return BookView(None, 0.0, None, 0.0, None, None, 0.0, 0.0)

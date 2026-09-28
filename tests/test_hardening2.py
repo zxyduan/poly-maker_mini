@@ -9,8 +9,9 @@ import time
 
 from polymaker.domain import Fill, Position, Regime, Side
 from polymaker.state.store import StateStore
-from polymaker.strategy.quoting import QuoteInputs, construct_quotes
-from tests.conftest import view
+from polymaker.strategy.base import StrategyInputs
+from polymaker.strategy.quoting import construct_quotes
+from tests.conftest import book
 from tests.test_engine import _engine_with_market, _feed_book
 
 
@@ -33,9 +34,9 @@ def test_inflight_expires_after_max_age(tmp_path):
 # ── T0-7: exit sizing floors (never over-sell) ───────────────────────────
 def test_exit_size_is_floored(meta, profile):
     # hold a fractional position; the SELL must be floored so size <= held
-    tq = construct_quotes(QuoteInputs(
+    tq = construct_quotes(StrategyInputs(
         meta=meta, regime=Regime.REDUCE_ONLY, fv=0.5, vol_short=0.0, toxicity=0.0,
-        yes_view=view(0.49, 0.51), no_view=view(0.49, 0.51),
+        yes_book=book(0.49, 0.51), no_book=book(0.49, 0.51),
         pos_yes=Position("yes-token", 17.999, 0.4), pos_no=Position("no-token"),
         profile=profile, now=1000.0,
     ))
@@ -186,9 +187,9 @@ def test_per_layer_reward_floor(meta, profile):
 
     m = replace(meta, rewards_min_size=100.0)
     p = profile.with_overrides({"base_size_usdc": 100.0, "layers": 2})
-    tq = construct_quotes(QuoteInputs(
+    tq = construct_quotes(StrategyInputs(
         meta=m, regime=Regime.QUIET, fv=0.20, vol_short=0.0, toxicity=0.0,
-        yes_view=view(0.195, 0.197), no_view=view(0.802, 0.805),
+        yes_book=book(0.195, 0.197), no_book=book(0.802, 0.805),
         pos_yes=Position("yes-token"), pos_no=Position("no-token"),
         profile=p, now=1000.0,
     ))

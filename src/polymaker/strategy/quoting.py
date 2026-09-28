@@ -17,11 +17,10 @@ score rewards, and a filled pair merges back to USDC at locked edge 1 - p - q.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
-from polymaker.config import StrategyProfile
 from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQuotes
-from polymaker.marketdata.orderbook import BookView
+from polymaker.marketdata.orderbook import BookView, OrderBook
+from polymaker.strategy.base import StrategyInputs
 
 _EPS = 1e-9
 
@@ -40,33 +39,30 @@ def compute_fair_value(microprice: float, flow_z: float, tick: float, weight: fl
     return min(max(fv, tick), 1.0 - tick)
 
 
-@dataclass(frozen=True, slots=True)
-class QuoteInputs:
-    meta: MarketMeta
-    regime: Regime
-    fv: float  # YES fair value in (0,1)
-    vol_short: float
-    toxicity: float
-    yes_view: BookView
-    no_view: BookView
-    pos_yes: Position
-    pos_no: Position
-    profile: StrategyProfile
-    now: float
-    risk_size_scale: float = 1.0  # RiskManager may throttle size in [0,1]
-    yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
-    no_exit_urgency: float = 0.0
+def _empty_view() -> BookView:
+    """A degenerate BookView used when a book is unavailable (never quote off it)."""
+    return BookView(None, 0.0, None, 0.0, None, None, 0.0, 0.0)
 
 
-def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
+def _view(book: OrderBook | None) -> BookView:
+    return book.view() if book is not None and not book.is_empty else _empty_view()
+
+
+def construct_quotes(inp: StrategyInputs) -> TargetQuotes:
     m = inp.meta
     p = inp.profile
+    regime = inp.regime if inp.regime is not None else Regime.QUIET
     tick = m.tick_size
     dec = m.price_decimals
     cid = m.condition_id
 
-    if inp.regime in (Regime.EVENT, Regime.HALTED):
-        return TargetQuotes(cid, inp.regime, ())
+    # Top-of-book snapshot derived from the live OrderBook (this strategy only
+    # needs best/second/depth, not the full ladder).
+    yes_view = _view(inp.yes_book)
+    no_view = _view(inp.no_book)
+
+    if regime in (Regime.EVENT, Regime.HALTED):
+        return TargetQuotes(cid, regime, ())
 
     quotes: list[Quote] = []
 
@@ -82,7 +78,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     base = p.delta_min_ticks * tick
     delta = base + p.c_vol * inp.vol_short + p.c_tox * inp.toxicity
     reward_band = m.rewards_max_spread / 100.0
-    if inp.regime == Regime.QUIET and reward_band > 0:
+    if regime == Regime.QUIET and reward_band > 0:
         delta = _clamp(delta, base, max(base, reward_band))
     delta = max(delta, tick)
 
@@ -91,17 +87,17 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     no_bid_target = (1.0 - r) - delta
 
     # ── size scaling ────────────────────────────────────────────────────
-    regime_scale = 0.5 if inp.regime == Regime.TRENDING else 1.0
+    regime_scale = 0.5 if regime == Regime.TRENDING else 1.0
     tox_scale = 1.0 / (1.0 + inp.toxicity * 10.0)
     common_scale = regime_scale * tox_scale * _clamp(inp.risk_size_scale, 0.0, 1.0)
 
     soft_cap = p.q_soft_frac  # fraction of q_max at which the adding side pulls
-    add_yes = inp.regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
-    add_no = inp.regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
+    add_yes = regime not in (Regime.REDUCE_ONLY,) and u < soft_cap
+    add_no = regime not in (Regime.REDUCE_ONLY,) and u > -soft_cap
 
     # entry: BUY YES
     if add_yes:
-        price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
+        price = _place_bid(yes_bid_target, yes_view, tick, dec, inp.fv, p.min_edge_ticks)
         if price is not None:
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
@@ -111,7 +107,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     # entry: BUY NO
     if add_no:
         no_fv = 1.0 - inp.fv
-        price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
+        price = _place_bid(no_bid_target, no_view, tick, dec, no_fv, p.min_edge_ticks)
         if price is not None:
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
@@ -119,12 +115,12 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
                         exchange_min=m.min_order_size, reward_floor=reward_floor)
 
     # ── exits: SELL held inventory (maker, never cross) ─────────────────
-    _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, inp.yes_view, tick, dec,
-                inp.yes_exit_urgency, m, inp.regime)
-    _maybe_exit(quotes, m.no.token_id, inp.pos_no, 1.0 - inp.fv, delta, inp.no_view, tick, dec,
-                inp.no_exit_urgency, m, inp.regime)
+    _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, yes_view, tick, dec,
+                inp.yes_exit_urgency, m, regime)
+    _maybe_exit(quotes, m.no.token_id, inp.pos_no, 1.0 - inp.fv, delta, no_view, tick, dec,
+                inp.no_exit_urgency, m, regime)
 
-    return TargetQuotes(cid, inp.regime, tuple(quotes))
+    return TargetQuotes(cid, regime, tuple(quotes))
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

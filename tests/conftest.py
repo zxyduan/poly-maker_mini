@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from polymaker.config import StrategyProfile
+from polymaker.config import MakerProfile as StrategyProfile
 from polymaker.domain import MarketMeta, TokenMeta
-from polymaker.marketdata.orderbook import BookView
+from polymaker.marketdata.orderbook import BookView, OrderBook
 
 
 @pytest.fixture
@@ -47,3 +47,17 @@ def view(bb: float | None, ba: float | None, bb_sz: float = 500, ba_sz: float = 
         bid_depth=bb_sz,
         ask_depth=ba_sz,
     )
+
+
+def book(bb: float | None, ba: float | None, bb_sz: float = 500, ba_sz: float = 500,
+         tick: float = 0.01) -> OrderBook:
+    """Build a live OrderBook whose top-of-book is (bb, ba) with the given sizes.
+
+    Mirrors `view()` so strategy tests can pass real books (which carry the full
+    ladder) to StrategyInputs instead of pre-built BookViews.
+    """
+    b = OrderBook(tick_size=tick)
+    bids = [(bb, bb_sz)] if bb is not None else []
+    asks = [(ba, ba_sz)] if ba is not None else []
+    b.apply_snapshot(bids, asks, ts=1000.0)
+    return b

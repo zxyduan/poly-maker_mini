@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from polymaker.config import StrategyProfile
+from polymaker.config import MakerProfile as StrategyProfile
 from polymaker.domain import Regime
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 

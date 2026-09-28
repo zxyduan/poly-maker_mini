@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, Self
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -153,8 +153,8 @@ class PathsConfig(BaseModel):
     log_dir: str = "logs"
 
 
-class StrategyProfile(BaseModel):
-    """One named parameter set. Every knob the quoter uses lives here."""
+class _BaseProfile(BaseModel):
+    """Knobs shared by every strategy. Per-strategy knobs live on the subclass."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -203,49 +203,70 @@ class StrategyProfile(BaseModel):
     exit_urgency_s: float = 900.0
     merge_min_size: float = 20.0
 
-    # 策略类型："maker"（默认，原有双边做市）| "one_way"（单边做市）
-    type: str = "maker"
+    def with_overrides(self, overrides: dict[str, Any]) -> Self:
+        """Return a copy with per-market override values applied (preserves subclass)."""
+        if not overrides:
+            return self
+        # Only apply overrides that exist on this model; ignore unknown keys.
+        known = {k: v for k, v in overrides.items() if k in type(self).model_fields}
+        return self.model_copy(update=known)
 
-    # ── 单边做市专属字段（type="one_way" 时生效）──
-    # 只做 BUY YES（小概率方）：下行有限，突发事件=利好
+
+class MakerProfile(_BaseProfile):
+    """Two-sided (BUY-YES + BUY-NO) market-making. The default strategy."""
+
+    type: Literal["maker"] = "maker"
+
+
+class OneWayProfile(_BaseProfile):
+    """One-sided directional buying of the longshot YES leg.
+
+    Pyramid bids below the touch anchored behind large walls; exits via dynamic
+    edge sells. Downside is capped; a YES surge is the upside case.
+    """
+
+    type: Literal["one_way"] = "one_way"
+
     ow_side: str = "yes"
-    # 金字塔加仓份额：贴 touch→深处递增（1:2:3:4）；实际挂单打到价格地板会自动停，
-    # 低 mid 市场自然只出 1~2 层，不会凑数。
+    # pyramid shares: top-of-touch small, deeper larger (1:2:3:4 by default)
     ow_pyramid_shares: list[float] = Field(default_factory=lambda: [0.10, 0.20, 0.30, 0.40])
-    # 大单墙阈值：某档名义(份额×价格) >= volume_24hr × 此比例 算厚墙
+    # a level whose notional >= volume_24hr * this fraction counts as a thick wall
     ow_wall_pct_of_24h: float = 0.005
-    # 挂墙后方便宜 N tick（墙不破便宜排队，墙破先吃）
+    # sit ow_wall_skip_ticks ahead of a wall (queue priority)
     ow_wall_skip_ticks: int = 1
-    # 墙与墙之间最小间隔（tick）：下一层墙必须比上一层墙再低这么多，避免多层叠在一堵墙后
+    # min gap between chained walls so layers don't stack behind the same wall
     ow_wall_min_gap_ticks: int = 5
-    # 动态 edge 基础 tick 数（c_vol/c_tox 复用现有字段叠加）
+    # dynamic edge over avg cost for the exit sell (in ticks)
     ow_edge_base_ticks: int = 5
-    # 单边策略的再报价 tick 阈值（本地策略新增字段，配置里可覆盖）
-    ow_reprice_ticks: int = 1
-    # 卖盘无墙（盘口稀薄）时，持仓分几档价位出
+    # thin-book exits: split held size across this many price levels
     ow_sell_split_levels: int = 3
-    # 阴跌三级刹车线（库存利用率 u = 持仓/q_max）
+    # inventory braking lines (utilization = held / q_max)
     ow_inv_low: float = 0.33
     ow_inv_mid: float = 0.66
-    # flow_z 连续 N 个周期为负才确认阴跌趋势
+    # require flow_z this many consecutive negative ticks to confirm a downtrend
     ow_flowz_confirm: int = 5
-    # 砸盘快信号
+    # crash fast-signals
     ow_panic_toxicity: float = 0.6
     ow_bid_drop_ticks: int = 3
     ow_panic_seconds: float = 10.0
     ow_cooldown_s: float = 45.0
-    # 到期前 N 天只卖不买
+    # go sell-only this many days before settlement
     ow_exit_days_before: float = 30.0
 
-    def with_overrides(self, overrides: dict[str, Any]) -> StrategyProfile:
-        """Return a copy with per-market override values applied."""
-        if not overrides:
-            return self
-        data = self.model_dump()
-        for k, v in overrides.items():
-            if k in data:
-                data[k] = v
-        return StrategyProfile(**data)
+
+# A profile is one of the two strategy types. TOML selects via the `type` key.
+StrategyProfile = MakerProfile | OneWayProfile
+
+
+def _parse_profile(name: str, params: dict[str, Any]) -> StrategyProfile:
+    """Build the right profile subclass from a TOML table.
+
+    No `type` key defaults to maker for backward compatibility with existing configs.
+    """
+    t = params.get("type", "maker")
+    if t == "one_way":
+        return OneWayProfile(**params)
+    return MakerProfile(**params)
 
 
 # Keys allowed on a market entry that are NOT profile overrides.
@@ -347,7 +368,7 @@ class Config(BaseModel):
         mkts = _read_toml(cdir / "markets.toml")
 
         profiles = {
-            name: StrategyProfile(**params)
+            name: _parse_profile(name, params)
             for name, params in (strat.get("profiles") or {}).items()
         }
         markets = [MarketEntry(**m) for m in (mkts.get("markets") or [])]

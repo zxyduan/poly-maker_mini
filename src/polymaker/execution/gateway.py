@@ -562,6 +562,31 @@ class ExecutionGateway:
         return 0.0
 
     # ── heartbeat (dead-man switch) ─────────────────────────────────────
+    def _beat_once(self) -> bool:
+        """Single heartbeat attempt (sync; runs on the I/O executor).
+
+        New contract ``POST /heartbeats`` first; fall back to the legacy
+        ``/v1/heartbeats`` only on 404. Network/transport errors return False so
+        the caller increments the failure counter; non-404 HTTP errors on the new
+        path do not retry the legacy path.
+        """
+        for path in ("/heartbeats", "/v1/heartbeats"):
+            headers = l2_headers(self._client, "POST", path)
+            try:
+                r = httpx.post(
+                    f"{self._cfg.wallet.clob_host}{path}",
+                    headers=headers,
+                    timeout=10.0,
+                )
+            except httpx.TransportError as exc:
+                log.debug("heartbeat_transport_error", path=path, err=str(exc))
+                return False
+            if r.status_code == 200:
+                return True
+            if r.status_code != 404:
+                break  # 4xx/5xx on the new path: legacy fallback won't help
+        return False
+
     async def heartbeat(self) -> bool:
         """Send one heartbeat tick. Returns True on success.
 
@@ -576,23 +601,8 @@ class ExecutionGateway:
         if self._paper or self._client is None:
             return True
 
-        def _beat() -> bool:
-            # New path first; fall back to the legacy path only if 404.
-            for path in ("/heartbeats", "/v1/heartbeats"):
-                headers = l2_headers(self._client, "POST", path)
-                r = httpx.post(
-                    f"{self._cfg.wallet.clob_host}{path}",
-                    headers=headers,
-                    timeout=10.0,
-                )
-                if r.status_code == 200:
-                    return True
-                if r.status_code != 404:
-                    break
-            return False
-
         try:
-            ok = await self._io(_beat)
+            ok = await self._io(self._beat_once)
             if not ok:
                 raise RuntimeError("heartbeat not acknowledged by exchange")
             if self._hb_failures:
@@ -716,6 +726,3 @@ class PlaceReject:
     size: float
     category: str
     msg: str
-
-
-# （注：内容由AI生成）

@@ -479,3 +479,9 @@ positions/
 data/
 *.whl
 session/
+
+# operational artifacts (not source)
+books.csv
+*.zip
+*.patch
+config/markets copy.toml

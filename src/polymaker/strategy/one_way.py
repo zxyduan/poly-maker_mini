@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import math
 
-from polymaker.config import StrategyProfile
-from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQuotes
+from polymaker.domain import Quote, Regime, Side, TargetQuotes
 from polymaker.logging import get_logger
 from polymaker.marketdata.orderbook import OrderBook
+from polymaker.strategy.base import StrategyInputs
 from polymaker.strategy.quoting import round_to_tick
 
 log = get_logger("strategy.one_way")
@@ -21,26 +21,34 @@ log = get_logger("strategy.one_way")
 _EPS = 1e-9
 
 
-def construct_one_way_quotes(
-    meta: MarketMeta,
-    profile: StrategyProfile,
-    yes_book: OrderBook | None,
-    no_book: OrderBook | None,  # 保留签名对称；v0.5 只做 YES，不读
-    now: float,
-    *,
-    fv: float,
-    vol_short: float,
-    toxicity: float,
-    pos_yes: Position,
-    risk_size_scale: float = 1.0,
-    hours_to_end: float | None = None,
-) -> TargetQuotes:
+def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
     """Produce the BUY-YES pyramid + SELL exit for one market at a point in time."""
-    p = profile
+    from polymaker.config import OneWayProfile
+
+    meta = inp.meta
+    p = inp.profile
+    # Runtime guard + mypy narrowing: this strategy only runs when the profile
+    # is an OneWayProfile (the registry dispatches on profile.type).
+    if not isinstance(p, OneWayProfile):
+        raise TypeError(f"one_way strategy requires OneWayProfile, got {type(p).__name__}")
+    yes_book = inp.yes_book
+    fv = inp.fv
+    toxicity = inp.toxicity
+    pos_yes = inp.pos_yes
+    risk_size_scale = inp.risk_size_scale
+    hours_to_end = inp.hours_to_end
+    # Engine-decided regime: respect hard stops (news/halt -> pull quotes).
+    regime = inp.regime if inp.regime is not None else Regime.QUIET
+
     tick = meta.tick_size
     dec = meta.price_decimals
     cid = meta.condition_id
     token_id = meta.yes.token_id  # v0.5 固定只做 YES 小概率方
+
+    # Hard stops agreed with the two-sided strategy: on news/sweep or a halt,
+    # cancel everything rather than keep catching a falling knife.
+    if regime in (Regime.EVENT, Regime.HALTED):
+        return TargetQuotes(cid, regime, ())
 
     # ── 模式判定：到期前 ow_exit_days_before 天 → 只卖不买 ───────────────
     exit_only = (
@@ -76,7 +84,7 @@ def construct_one_way_quotes(
                 prices, fracs = [calm_price], [1.0]
                 sell_mode = "caml_under_ask"
 
-            for pr, fr in zip(prices, fracs):
+            for pr, fr in zip(prices, fracs, strict=True):
                 pr = max(pr, floor_price)
                 pr = round_to_tick(pr, tick, dec, up=True)
                 if bb is not None:
@@ -168,21 +176,26 @@ def construct_one_way_quotes(
     _bw = (_find_wall_below(yes_book, bb_lv.price, wall_notional)
            if (yes_book and bb_lv is not None) else None)
     bid_wall = _bw[0] if _bw else None
-    log.info("ow_quote", cid=cid[:8], held=round(held, 2), inv_util=round(u, 2),
-             buy_scale=round(buy_scale, 2),
-             bb=bb_lv.price if bb_lv else None,
-             ba=ba_lv.price if ba_lv else None,
-             bid_top=[(round(p, 4), s) for p, s in bid_top3],
-             ask_top=[(round(p, 4), s) for p, s in ask_top3],
-             bid_wall=bid_wall,
-             wall_notional=round(wall_notional, 2),
-             buy_n=len(buys),
-             buy_prices=[round(q.price, 4) for q in buys],
-             buy_sizes=[q.size for q in buys],
-             sell_n=len([q for q in quotes if q.side is Side.SELL]))
+    # Per-tick book snapshot: debug level (firehose at requote frequency);
+    # ow_sell / ow_panic / ow_reduce_only above stay at info/warn as event logs.
+    log.debug("ow_quote", cid=cid[:8], held=round(held, 2), inv_util=round(u, 2),
+              buy_scale=round(buy_scale, 2),
+              bb=bb_lv.price if bb_lv else None,
+              ba=ba_lv.price if ba_lv else None,
+              bid_top=[(round(p, 4), s) for p, s in bid_top3],
+              ask_top=[(round(p, 4), s) for p, s in ask_top3],
+              bid_wall=bid_wall,
+              wall_notional=round(wall_notional, 2),
+              buy_n=len(buys),
+              buy_prices=[round(q.price, 4) for q in buys],
+              buy_sizes=[q.size for q in buys],
+              sell_n=len([q for q in quotes if q.side is Side.SELL]))
 
-    regime_out = Regime.REDUCE_ONLY if u >= 1.0 else Regime.QUIET
-    return TargetQuotes(cid, regime_out, tuple(quotes))
+    # Inventory at hard cap -> exits only. The engine's RegimeMachine already
+    # flags REDUCE_ONLY via inventory_util >= 1.0; honor it explicitly so the
+    # reported regime matches what we actually do.
+    effective_regime = Regime.REDUCE_ONLY if u >= 1.0 else regime
+    return TargetQuotes(cid, effective_regime, tuple(quotes))
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
