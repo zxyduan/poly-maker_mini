@@ -70,6 +70,11 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
             )
         else:
             price = (best_ask - tick) if best_ask is not None else None
+        # post-only SELL must rest strictly above the best bid. When the spread
+        # is a single tick, best_ask - tick == best_bid and would cross through
+        # it — floor at best_bid + tick (joins the ask instead of sweeping it).
+        if price is not None and best_bid is not None:
+            price = max(price, best_bid + tick)
         if price is not None and 0.0 < price < 1.0:
             size = math.floor(held * 100) / 100
             if size >= m.min_order_size:

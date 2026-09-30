@@ -115,3 +115,17 @@ def test_near_end_is_sell_only(meta):
 def test_profile_type_discriminator():
     assert StrategyProfile().type == "maker"
     assert OneWayProfile().type == "one_way"
+
+
+def test_exit_sell_never_crosses_one_tick_spread(meta):
+    # spread == 1 tick: best_ask - tick == best_bid; the sell must floor at
+    # best_bid + tick (= best_ask) instead of landing on the bid and crossing.
+    book = _book([(0.033, 200)], [(0.034, 200)])
+    tq = get_strategy("one_way")(_inputs(
+        meta, OneWayProfile(), yes_book=book,
+        pos_yes=Position("yes-token", 100, 0.03),
+    ))
+    sells = [q for q in tq.quotes if q.side == Side.SELL]
+    assert sells, "expected a sell exit"
+    # post-only sell must be strictly above best_bid (0.033)
+    assert sells[0].price > 0.033 + 1e-9
