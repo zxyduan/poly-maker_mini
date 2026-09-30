@@ -85,3 +85,23 @@ halt_before_hours   = 2
 # --- exits ---
 exit_urgency_s      = 900
 merge_min_size      = 20.0
+
+
+# one-way accumulator example: rest BUY bids under book walls on a single side.
+# Select by setting a market's `profile = "yes-pyramid"` in markets.toml.
+[profiles.yes-pyramid]
+type = "one_way"
+ow_side = "yes"
+# shared knobs (same as maker)
+base_size_usdc = 50.0
+q_max_usdc = 500.0
+event_cooloff_s = 60.0
+# one-way knobs
+ow_pyramid_shares = [0.10, 0.20, 0.30, 0.40]
+ow_wall_pct_of_24h = 0.005
+ow_wall_skip_ticks = 1
+ow_wall_min_gap_ticks = 5
+ow_inv_low = 0.33
+ow_inv_mid = 0.66
+ow_panic_toxicity = 0.6
+ow_exit_days_before = 30.0

@@ -13,11 +13,37 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ScanSettings(BaseModel):
+    """The ``[scan]`` section: which Gamma tags the market sweep covers.
+
+    ``tag_slugs`` accepts either a TOML array (``["politics","sports"]``) or a
+    comma-separated string (``"politics, sports"``). An empty list means
+    "scan the whole site" (no tag filter). The default keeps the historical
+    politics-only behavior so existing configs are unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tag_slugs: tuple[str, ...] = ("politics",)
+    min_liquidity: float = 1000.0
+    min_volume_24hr: float = 0.0
+    rewards_only: bool = True
+
+    @field_validator("tag_slugs", mode="before")
+    @classmethod
+    def _normalize_tag_slugs(cls, v: Any) -> tuple[str, ...]:
+        if v is None:
+            return ()
+        if isinstance(v, str):
+            return tuple(s.strip() for s in v.split(",") if s.strip())
+        return tuple(str(s).strip() for s in v if str(s).strip())
 
 
 class WalletConfig(BaseModel):
@@ -69,9 +95,16 @@ class PathsConfig(BaseModel):
 
 
 class StrategyProfile(BaseModel):
-    """One named parameter set. Every knob the quoter uses lives here."""
+    """The two-sided maker parameter set.
+
+    Subclassed by :class:`OneWayProfile`; ``type`` is the discriminator the
+    strategy registry uses to pick a quoter. Defaults reproduce the historical
+    maker behavior exactly.
+    """
 
     model_config = ConfigDict(extra="forbid")
+
+    type: Literal["maker"] = "maker"
 
     # fair value
     micro_levels: int = 3
@@ -119,14 +152,48 @@ class StrategyProfile(BaseModel):
     merge_min_size: float = 20.0
 
     def with_overrides(self, overrides: dict[str, Any]) -> StrategyProfile:
-        """Return a copy with per-market override values applied."""
+        """Return a copy with per-market override values applied.
+
+        Uses ``model_copy(update=...)`` so the concrete subclass (maker vs
+        one_way) is preserved — a ``model_dump()`` round-trip would erase it.
+        """
         if not overrides:
             return self
-        data = self.model_dump()
-        for k, v in overrides.items():
-            if k in data:
-                data[k] = v
-        return StrategyProfile(**data)
+        allowed = {k: v for k, v in overrides.items() if k in self.model_fields}
+        return self.model_copy(update=allowed)
+
+
+class OneWayProfile(StrategyProfile):
+    """One-way pyramid accumulator: rest bids under book walls on a single side.
+
+    On EVENT/HALTED all quotes pull; sells rest one tick under the ask (or dump
+    to the bid when toxic / near expiry); buys fan out as a weighted pyramid that
+    chains down successive walls, throttled by inventory utilization.
+    """
+
+    type: Literal["one_way"] = "one_way"  # type: ignore[assignment]  # narrows base discriminator
+
+    ow_side: Literal["yes", "no"] = "yes"
+    # pyramid weights summing to 1 across buy layers (fraction of base_size)
+    ow_pyramid_shares: list[float] = [0.10, 0.20, 0.30, 0.40]
+    # a wall = a bid level whose notional (price*size) >= 24h volume * this
+    ow_wall_pct_of_24h: float = 0.005
+    # rest this many ticks above the discovered wall
+    ow_wall_skip_ticks: int = 1
+    # require this many ticks of separation between pyramid layers
+    ow_wall_min_gap_ticks: int = 5
+    ow_edge_base_ticks: int = 5
+    # inventory brakes on held / q_max_shares
+    ow_inv_low: float = 0.33  # below: full size
+    ow_inv_mid: float = 0.66  # above: stop buying entirely
+    # toxicity >= this => exit into the bid instead of resting under the ask
+    ow_panic_toxicity: float = 0.6
+    # within this many days of end: sell only, no new buys
+    ow_exit_days_before: float = 30.0
+
+
+# Union alias used by the loader + type annotations.
+AnyProfile = StrategyProfile | OneWayProfile
 
 
 # Keys allowed on a market entry that are NOT profile overrides.
@@ -193,6 +260,7 @@ class Config(BaseModel):
     risk: RiskConfig = RiskConfig()
     execution: ExecutionConfig = ExecutionConfig()
     paths: PathsConfig = PathsConfig()
+    scan: ScanSettings = ScanSettings()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
     secrets: Secrets = Field(default_factory=Secrets)
@@ -224,8 +292,11 @@ class Config(BaseModel):
         strat = _read_toml(cdir / "strategy.toml")
         mkts = _read_toml(cdir / "markets.toml")
 
+        # A profile with only maker fields -> StrategyProfile (first union member).
+        # One with `type="one_way"` / ow_* knobs falls through to OneWayProfile.
+        profile_adapter: TypeAdapter[AnyProfile] = TypeAdapter(StrategyProfile | OneWayProfile)
         profiles = {
-            name: StrategyProfile(**params)
+            name: profile_adapter.validate_python(params)
             for name, params in (strat.get("profiles") or {}).items()
         }
         markets = [MarketEntry(**m) for m in (mkts.get("markets") or [])]
@@ -236,6 +307,7 @@ class Config(BaseModel):
             risk=RiskConfig(**main.get("risk", {})),
             execution=ExecutionConfig(**main.get("execution", {})),
             paths=PathsConfig(**main.get("paths", {})),
+            scan=ScanSettings(**main.get("scan", {})),
             profiles=profiles,
             markets=markets,
             secrets=Secrets(),

@@ -31,13 +31,15 @@ from polymaker.merge import Merger
 from polymaker.risk.manager import RiskManager
 from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
+from polymaker.strategy import StrategyFn, get_strategy
+from polymaker.strategy.base import StrategyInputs
 from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
     MarkoutTracker,
     VolEstimator,
 )
-from polymaker.strategy.quoting import QuoteInputs, compute_fair_value, construct_quotes
+from polymaker.strategy.quoting import compute_fair_value
 from polymaker.strategy.regime import RegimeInputs, RegimeMachine
 from polymaker.userstream.client import UserStream
 
@@ -68,6 +70,7 @@ class Engine:
         # per-market state
         self.metas: dict[str, MarketMeta] = {}
         self.profiles: dict[str, StrategyProfile] = {}
+        self.strategy_fn: dict[str, StrategyFn] = {}
         self.est: dict[str, MarketEstimators] = {}
         self.regime_m: dict[str, RegimeMachine] = {}
         self._dirty: dict[str, asyncio.Event] = {}
@@ -187,8 +190,11 @@ class Engine:
                     log.warning("market_unresolved", ref=entry.ref)
                     continue
                 self.metas[meta.condition_id] = meta
-                self.profiles[meta.condition_id] = self.cfg.profile_for(entry)
-                self.est[meta.condition_id] = self._make_estimators(self.profiles[meta.condition_id])
+                p = self.cfg.profile_for(entry)
+                self.profiles[meta.condition_id] = p
+                # resolve the quoter once by profile type (no hot-path branching)
+                self.strategy_fn[meta.condition_id] = get_strategy(p.type)
+                self.est[meta.condition_id] = self._make_estimators(p)
                 self.regime_m[meta.condition_id] = RegimeMachine()
                 self._dirty[meta.condition_id] = asyncio.Event()
                 self._locks[meta.condition_id] = asyncio.Lock()
@@ -199,17 +205,22 @@ class Engine:
         self, gamma: GammaClient, slug: str | None, condition_id: str | None,
         reward_rates: dict[str, float],
     ) -> MarketMeta | None:
-        tag_id = self.catalog.cached_tag("politics")
-        if tag_id is None:  # cold start: resolve + cache so the sweep is scoped
-            tag_id = await gamma.resolve_tag_id("politics")
-            if tag_id:
-                self.catalog.cache_tag("politics", tag_id)
-        async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
-            if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
-                m = parse_market(raw, reward_rates)
-                if m:
-                    self.catalog.upsert_market(m)
-                return m
+        # Resolve each configured tag (cached) and search it for the requested
+        # market. An empty tag list => one unfiltered whole-site sweep.
+        for tag in self.cfg.scan.tag_slugs or (None,):
+            tag_id: str | None = None
+            if tag is not None:
+                tag_id = self.catalog.cached_tag(tag)
+                if tag_id is None:
+                    tag_id = await gamma.resolve_tag_id(tag)
+                    if tag_id:
+                        self.catalog.cache_tag(tag, tag_id)
+            async for raw in gamma.iter_markets(tag_id=tag_id, max_pages=25):
+                if (slug and raw.get("slug") == slug) or (condition_id and raw.get("conditionId") == condition_id):
+                    m = parse_market(raw, reward_rates)
+                    if m:
+                        self.catalog.upsert_market(m)
+                    return m
         return None
 
     @staticmethod
@@ -444,12 +455,14 @@ class Engine:
             p,
         )
 
-        tq = construct_quotes(QuoteInputs(
-            meta=meta, regime=regime, fv=fv, vol_short=est.vol.short,
-            toxicity=est.markout.toxicity, yes_view=yes_book.view(),
-            no_view=(no_book.view() if no_book else _empty_view()),
-            pos_yes=pos_yes, pos_no=pos_no, profile=p, now=now,
-            risk_size_scale=rd.size_scale,
+        quoter = self.strategy_fn.get(cid)
+        if quoter is None:  # market added outside _resolve_markets (tests/manual)
+            quoter = self.strategy_fn[cid] = get_strategy(p.type)
+        tq = quoter(StrategyInputs(
+            meta=meta, profile=p, yes_book=yes_book, no_book=no_book,
+            now=now, fv=fv, vol_short=est.vol.short, toxicity=est.markout.toxicity,
+            pos_yes=pos_yes, pos_no=pos_no, regime=regime,
+            risk_size_scale=rd.size_scale, hours_to_end=hours_to_end,
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)

@@ -30,6 +30,7 @@ from polymaker.config import Config
 from polymaker.domain import MarketMeta, OpenOrder, OrderState, Quote, Side
 from polymaker.execution.ratelimit import TokenBucket
 from polymaker.journal import Journal
+from polymaker.l2auth import l2_headers
 from polymaker.logging import get_logger
 
 log = get_logger("execution.gateway")
@@ -441,14 +442,46 @@ class ExecutionGateway:
         return 0.0
 
     # ── heartbeat (dead-man switch) ─────────────────────────────────────
-    def _beat_once(self) -> bool:
-        """Single heartbeat attempt.
+    async def _beat_once(self) -> bool:
+        """One stateless, self-signed ``POST /heartbeats``.
 
-        NOTE: the stateless L2-signed ``POST /heartbeats`` migration lands in
-        the next change-set (requirement 2). Until then this fails CLOSED — the
-        engine halts quoting rather than quoting with a dead safety net. Paper
-        mode bypasses this entirely.
+        The unified SDK does not wrap this endpoint, so we sign it ourselves
+        with the L2 key/secret (see :mod:`polymaker.l2auth`). No body, no
+        chained heartbeat-id — a 2xx ack is the whole contract. If the new
+        path 404s, fall back to the legacy ``/v1/heartbeats``.
         """
+        creds = self._creds
+        if creds is None or not getattr(creds, "key", ""):
+            return False
+        host = self._cfg.wallet.clob_host.rstrip("/")
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            for path in ("/heartbeats", "/v1/heartbeats"):
+                headers = l2_headers(
+                    signer=self._address,
+                    key=creds.key,
+                    secret=creds.secret,
+                    passphrase=creds.passphrase,
+                    method="POST",
+                    path=path,
+                    body=None,
+                )
+                try:
+                    r = await c.post(f"{host}{path}", headers=headers)
+                except httpx.TransportError as exc:
+                    log.warning("heartbeat_transport_error", path=path, err=str(exc))
+                    continue
+                if r.status_code == 404:
+                    # endpoint not present on this host — try legacy path
+                    continue
+                if r.status_code in (200, 201, 204):
+                    return True
+                log.warning(
+                    "heartbeat_unexpected_status",
+                    status=r.status_code,
+                    path=path,
+                    body=r.text[:200],
+                )
+                return False
         return False
 
     async def heartbeat(self) -> bool:
@@ -462,7 +495,7 @@ class ExecutionGateway:
             return True
 
         try:
-            ok = await self._io(self._beat_once)
+            ok = await self._beat_once()
             if not ok:
                 raise RuntimeError("heartbeat not acknowledged by exchange")
             if self._hb_failures:

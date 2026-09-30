@@ -20,8 +20,6 @@ from polymaker.logging import get_logger
 
 log = get_logger("catalog.gamma")
 
-POLITICS_TAG_SLUG = "politics"
-
 
 class GammaClient:
     """Thin async wrapper over the Gamma REST endpoints we use."""

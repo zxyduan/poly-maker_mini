@@ -51,7 +51,15 @@ def scan(
     store = CatalogStore(cfg.paths.db)
 
     async def _go() -> int:
-        metas = await run_scan(store, ScanConfig(min_liquidity=min_liquidity, rewards_only=not all_markets))
+        scan_cfg = ScanConfig(
+            tag_slugs=cfg.scan.tag_slugs,
+            min_liquidity=min_liquidity,
+            min_volume_24hr=cfg.scan.min_volume_24hr,
+            rewards_only=not all_markets,
+            gamma_host=cfg.wallet.gamma_host,
+            clob_host=cfg.wallet.clob_host,
+        )
+        metas = await run_scan(store, scan_cfg)
         return len(metas)
 
     n = asyncio.run(_go())

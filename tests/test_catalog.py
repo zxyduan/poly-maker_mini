@@ -89,3 +89,18 @@ def test_store_upsert_is_idempotent(tmp_path):
     store.upsert_market(m)  # second time updates, not duplicates
     assert len(store.top(10)) == 1
     store.close()
+
+
+def test_scan_settings_normalizes_tag_slugs():
+    from polymaker.config import ScanSettings
+
+    # default preserves politics-only behavior
+    assert ScanSettings().tag_slugs == ("politics",)
+    # comma-separated string accepted
+    assert ScanSettings(tag_slugs="politics, sports ,crypto").tag_slugs == (
+        "politics", "sports", "crypto",
+    )
+    # list accepted
+    assert ScanSettings(tag_slugs=["a", "b"]).tag_slugs == ("a", "b")
+    # explicit empty => whole-site sweep (no tag filter)
+    assert ScanSettings(tag_slugs=[]).tag_slugs == ()

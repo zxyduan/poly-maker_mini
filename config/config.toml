@@ -49,3 +49,8 @@ max_orders_per_batch = 15       # exchange batch cap
 db = "state.db"
 journal_dir = "journal"
 log_dir = "logs"
+
+# Market discovery: which Gamma tags the sweep covers. Empty list = whole site.
+# tag_slugs = ["politics", "sports", "crypto"]
+# min_liquidity = 1000.0
+# rewards_only = true

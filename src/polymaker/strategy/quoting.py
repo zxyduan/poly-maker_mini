@@ -19,11 +19,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from polymaker.config import StrategyProfile
+from polymaker.config import AnyProfile
 from polymaker.domain import MarketMeta, Position, Quote, Regime, Side, TargetQuotes
-from polymaker.marketdata.orderbook import BookView
+from polymaker.marketdata.orderbook import BookView, OrderBook
+from polymaker.strategy.base import StrategyInputs
 
 _EPS = 1e-9
+
+# Empty top-of-book view used when a book side is missing.
+_EMPTY_VIEW = BookView(None, 0.0, None, 0.0, None, None, 0.0, 0.0)
+
+
+def _view(book: OrderBook | None) -> BookView:
+    return book.view() if book is not None else _EMPTY_VIEW
 
 
 def round_to_tick(price: float, tick: float, decimals: int, *, up: bool) -> float:
@@ -40,30 +48,63 @@ def compute_fair_value(microprice: float, flow_z: float, tick: float, weight: fl
     return min(max(fv, tick), 1.0 - tick)
 
 
+class _ViewOnlyBook:
+    """Minimal stand-in exposing just ``.view()`` for the legacy quote adapter."""
+
+    __slots__ = ("_view",)
+
+    def __init__(self, view: BookView) -> None:
+        self._view = view
+
+    def view(self, *_a: object, **_kw: object) -> BookView:
+        return self._view
+
+
 @dataclass(frozen=True, slots=True)
 class QuoteInputs:
+    """Legacy view-based inputs (retained so existing tests keep compiling)."""
+
     meta: MarketMeta
     regime: Regime
-    fv: float  # YES fair value in (0,1)
+    fv: float
     vol_short: float
     toxicity: float
     yes_view: BookView
     no_view: BookView
     pos_yes: Position
     pos_no: Position
-    profile: StrategyProfile
+    profile: AnyProfile
     now: float
-    risk_size_scale: float = 1.0  # RiskManager may throttle size in [0,1]
-    yes_exit_urgency: float = 0.0  # [0,1]; engine raises with hold time / adverse drift
+    risk_size_scale: float = 1.0
+    yes_exit_urgency: float = 0.0
     no_exit_urgency: float = 0.0
 
 
 def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
+    """Legacy adapter: build a StrategyInputs from view-only inputs and delegate."""
+    return construct_maker_quotes(
+        StrategyInputs(
+            meta=inp.meta, profile=inp.profile,
+            # _ViewOnlyBook satisfies the .view() contract the maker needs; it is
+            # not a full OrderBook, but the legacy adapter never reaches one_way.
+            yes_book=_ViewOnlyBook(inp.yes_view),  # type: ignore[arg-type]
+            no_book=_ViewOnlyBook(inp.no_view),  # type: ignore[arg-type]
+            now=inp.now, fv=inp.fv, vol_short=inp.vol_short, toxicity=inp.toxicity,
+            pos_yes=inp.pos_yes, pos_no=inp.pos_no, regime=inp.regime,
+            risk_size_scale=inp.risk_size_scale,
+            yes_exit_urgency=inp.yes_exit_urgency, no_exit_urgency=inp.no_exit_urgency,
+        )
+    )
+
+
+def construct_maker_quotes(inp: StrategyInputs) -> TargetQuotes:
     m = inp.meta
     p = inp.profile
     tick = m.tick_size
     dec = m.price_decimals
     cid = m.condition_id
+    yes_view = _view(inp.yes_book)
+    no_view = _view(inp.no_book)
 
     if inp.regime in (Regime.EVENT, Regime.HALTED):
         return TargetQuotes(cid, inp.regime, ())
@@ -101,7 +142,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
 
     # entry: BUY YES
     if add_yes:
-        price = _place_bid(yes_bid_target, inp.yes_view, tick, dec, inp.fv, p.min_edge_ticks)
+        price = _place_bid(yes_bid_target, yes_view, tick, dec, inp.fv, p.min_edge_ticks)
         if price is not None:
             _add_layers(quotes, m.yes.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(u, 0.0)), m),
@@ -111,7 +152,7 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
     # entry: BUY NO
     if add_no:
         no_fv = 1.0 - inp.fv
-        price = _place_bid(no_bid_target, inp.no_view, tick, dec, no_fv, p.min_edge_ticks)
+        price = _place_bid(no_bid_target, no_view, tick, dec, no_fv, p.min_edge_ticks)
         if price is not None:
             _add_layers(quotes, m.no.token_id, Side.BUY, price, tick, dec,
                         _size_shares(p.base_size_usdc, price, common_scale * (1 - max(-u, 0.0)), m),
@@ -119,9 +160,9 @@ def construct_quotes(inp: QuoteInputs) -> TargetQuotes:
                         exchange_min=m.min_order_size, reward_floor=reward_floor)
 
     # ── exits: SELL held inventory (maker, never cross) ─────────────────
-    _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, inp.yes_view, tick, dec,
+    _maybe_exit(quotes, m.yes.token_id, inp.pos_yes, inp.fv, delta, yes_view, tick, dec,
                 inp.yes_exit_urgency, m, inp.regime)
-    _maybe_exit(quotes, m.no.token_id, inp.pos_no, 1.0 - inp.fv, delta, inp.no_view, tick, dec,
+    _maybe_exit(quotes, m.no.token_id, inp.pos_no, 1.0 - inp.fv, delta, no_view, tick, dec,
                 inp.no_exit_urgency, m, inp.regime)
 
     return TargetQuotes(cid, inp.regime, tuple(quotes))
