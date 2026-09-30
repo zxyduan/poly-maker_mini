@@ -89,12 +89,12 @@ merge_min_size      = 20.0
 
 # one-way accumulator example: rest BUY bids under book walls on a single side.
 # Select by setting a market's `profile = "yes-pyramid"` in markets.toml.
-[profiles.yes-pyramid]
+[profiles.one_way]
 type = "one_way"
 ow_side = "yes"
 # shared knobs (same as maker)
-base_size_usdc = 50.0
-q_max_usdc = 500.0
+base_size_usdc = 30.0
+q_max_usdc = 60.0
 event_cooloff_s = 60.0
 # one-way knobs
 ow_pyramid_shares = [0.10, 0.20, 0.30, 0.40]
