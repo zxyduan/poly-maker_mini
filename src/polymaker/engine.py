@@ -166,7 +166,7 @@ class Engine:
             t.cancel()
         with contextlib.suppress(Exception):
             await self.gateway.cancel_all()
-        self.gateway.close()
+        await self.gateway.aclose()
         self.journal.close()
         self.state.close()
         self.catalog.close()

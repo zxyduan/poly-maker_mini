@@ -9,15 +9,8 @@ import pytest
 
 from polymaker.config import Config
 from polymaker.domain import Quote, Side
-from polymaker.execution.gateway import ExecutionGateway, _tick_str
+from polymaker.execution.gateway import ExecutionGateway
 from polymaker.execution.ratelimit import TokenBucket
-
-
-def test_tick_str_formats():
-    assert _tick_str(0.01) == "0.01"
-    assert _tick_str(0.001) == "0.001"
-    assert _tick_str(0.0025) == "0.0025"
-    assert _tick_str(0.1) == "0.1"
 
 
 async def test_token_bucket_limits_rate():

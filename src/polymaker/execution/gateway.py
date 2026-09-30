@@ -1,17 +1,22 @@
 """ExecutionGateway: the only component that sends actions to the CLOB.
 
-Wraps the synchronous py-clob-client-v2 (which owns the hard V2 EIP-712 signing,
-pUSD balance adjustment, and tick/fee caching) and offloads its blocking network
-calls to a thread pool so the asyncio hot path never stalls. Every quote goes out
-**post-only** (the maker-only mandate, enforced at the exchange).
+Wraps the unified async SDK (``polymarket-client`` — AsyncSecureClient) which
+owns the V2 EIP-712 signing, pUSD balance adjustment, and tick/fee resolution,
+and exposes async methods directly on the event loop (no thread-pool offload for
+order traffic: the unified client is natively async). Every quote goes out
+**post-only** (the maker-only mandate, enforced per-order at the exchange).
 
 A `paper=True` gateway shares the same path but fabricates order ids instead of
 posting — so paper mode exercises the full pipeline.
+
+The only blocking calls left on the internal pool are the on-chain web3 balance
+reads (Polygon RPC), which the SDK does not cover.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import time
 from collections.abc import Callable
@@ -32,10 +37,6 @@ log = get_logger("execution.gateway")
 _T = TypeVar("_T")
 
 
-def _tick_str(tick: float) -> str:
-    return f"{tick:g}"
-
-
 class ExecutionGateway:
     def __init__(
         self,
@@ -47,20 +48,18 @@ class ExecutionGateway:
         self._cfg = cfg
         self._paper = paper
         self._journal = journal
-        self._client: Any = None  # py_clob_client_v2.ClobClient
-        self._creds: Any = None
+        self._client: Any = None  # polymarket.AsyncSecureClient
+        self._creds: Any = None  # polymarket.ApiKeyCreds (key/secret/passphrase)
         self._address: str = ""  # signer EOA
         self._funder: str = ""  # funds/positions live here (proxy/deposit wallet)
-        self._data_host = cfg.wallet.data_api_host
         # rate budgets: fraction of documented POST/DELETE ceilings (per second)
         f = cfg.execution.rate_budget_fraction
         self._order_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._cancel_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._paper_ids = itertools.count(1)
-        self._hb_id: str = ""  # heartbeat chain
         self._hb_failures: int = 0
-        # dedicated, bounded pool for blocking order/HTTP calls so a burst of
-        # requotes across many markets can't starve the default executor
+        # dedicated, bounded pool for the blocking on-chain web3 balance reads,
+        # so they can't starve the asyncio event loop.
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clob-io")
 
     @property
@@ -75,8 +74,18 @@ class ExecutionGateway:
     def close(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
 
+    async def aclose(self) -> None:
+        """Async teardown: close the SDK client and the web3 thread pool."""
+        self.close()
+        client = self._client
+        self._client = None
+        self._creds = None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+
     async def _io(self, fn: Callable[..., _T], *args: Any) -> _T:
-        """Run a blocking client call on the dedicated pool."""
+        """Run a blocking (web3) call on the dedicated pool."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._pool, fn, *args)
 
@@ -96,7 +105,13 @@ class ExecutionGateway:
 
     # ── lifecycle ───────────────────────────────────────────────────────
     async def connect(self) -> None:
-        """Build the client and derive L2 API creds (network). No-op fields in paper."""
+        """Build the unified SDK client and derive L2 API creds (network).
+
+        ``AsyncSecureClient.create`` derives/creates the CLOB API key, resolves
+        the account wallet (EOA / Gnosis Safe / deposit wallet — the SDK
+        classifies on-chain from ``wallet``), and configures signing. No-op
+        fields in paper mode.
+        """
         sec = self._cfg.secrets
         if self._paper and not sec.has_wallet:
             # paper mode runs the full pipeline without a wallet (no orders posted)
@@ -107,29 +122,36 @@ class ExecutionGateway:
         if not sec.has_wallet:
             raise RuntimeError("no wallet configured (set PK and BROWSER_ADDRESS in .env)")
 
-        def _build() -> tuple[Any, Any, str]:
-            from py_clob_client_v2.client import ClobClient
+        from polymarket import AsyncSecureClient
 
-            client = ClobClient(
-                host=self._cfg.wallet.clob_host,
-                chain_id=self._cfg.wallet.chain_id,
-                key=sec.pk,
-                # use_server_time=False: fetching /time before EVERY signed order
-                # adds a full round-trip per op (latency killer through a proxy).
-                # We check clock drift once below and rely on the local (NTP) clock.
-                signature_type=self._cfg.wallet.signature_type,
-                funder=sec.browser_address,
+        try:
+            client = await AsyncSecureClient.create(
+                private_key=sec.pk,
+                # wallet = the funds/positions address (deposit wallet, safe, or
+                # EOA); the SDK resolves wallet type on-chain and signs accordingly.
+                wallet=sec.browser_address,
             )
-            creds = client.create_or_derive_api_key()
-            client.set_api_creds(creds)
-            return client, creds, client.get_address()
-
-        self._client, self._creds, self._address = await self._io(_build)
+        except Exception as exc:  # noqa: BLE001 - fatal but keep context for live ops
+            log.error(
+                "client_bootstrap_failed",
+                err=str(exc),
+                note="AsyncSecureClient.create (cred derivation / wallet classify / RPC)",
+            )
+            raise
+        self._client = client
+        self._creds = client.credentials
+        self._address = str(client.signer)
         await self._check_clock_drift()
         # funds/positions live on the funder (proxy/deposit wallet); fall back to EOA
         self._funder = sec.browser_address or self._address
-        log.info("gateway_connected", signer=self._address[:10], funder=self._funder[:10],
-                 paper=self._paper)
+        log.info(
+            "gateway_connected",
+            signer=self._address[:10],
+            funder=self._funder[:10],
+            wallet_type=getattr(client, "wallet_type", None),
+            creds_ready=bool(getattr(client.credentials, "key", "")),
+            paper=self._paper,
+        )
 
     async def _check_clock_drift(self) -> None:
         """Warn once if the local clock is skewed vs the exchange (affects L2 auth)."""
@@ -139,8 +161,11 @@ class ExecutionGateway:
                 server = float(r.text.strip().strip('"'))
             drift = abs(time.time() - server)
             if drift > 5.0:
-                log.warning("clock_drift", drift_s=round(drift, 1),
-                            note="sync system clock (NTP) — large skew can fail order auth")
+                log.warning(
+                    "clock_drift",
+                    drift_s=round(drift, 1),
+                    note="sync system clock (NTP) — large skew can fail order auth",
+                )
             else:
                 log.info("clock_ok", drift_s=round(drift, 1))
         except (httpx.HTTPError, ValueError) as exc:
@@ -157,27 +182,21 @@ class ExecutionGateway:
         if self._paper:
             return [self._paper_order(q) for q in quotes]
 
-        def _place() -> list[OpenOrder]:
-            from py_clob_client_v2.clob_types import (
-                OrderArgsV2,
-                OrderType,
-                PartialCreateOrderOptions,
-                PostOrdersV2Args,
-            )
-
-            opts = PartialCreateOrderOptions(tick_size=_tick_str(meta.tick_size), neg_risk=meta.neg_risk)
-            args = []
-            for q in quotes:
-                signed = self._client.create_order(
-                    OrderArgsV2(token_id=q.token_id, price=q.price, size=q.size, side=q.side.value),
-                    options=opts,
-                )
-                args.append(PostOrdersV2Args(order=signed, orderType=OrderType.GTC))
-            resp = self._client.post_orders(args, post_only=self._cfg.execution.post_only)
-            return self._parse_place_response(resp, quotes)
-
+        # The unified SDK resolves tick size / neg-risk / fees / signing per
+        # order; post-only is a per-order flag (maker-only mandate).
         try:
-            return await self._io(_place)
+            signed = [
+                await self._client.create_limit_order(
+                    token_id=q.token_id,
+                    price=q.price,
+                    size=q.size,
+                    side=q.side.value,
+                    post_only=self._cfg.execution.post_only,
+                )
+                for q in quotes
+            ]
+            resp = await self._client.post_orders(signed)
+            return self._parse_place_response(resp, quotes)
         except Exception as exc:  # noqa: BLE001 - surface + continue; engine handles error rate
             log.error("place_failed", err=str(exc), n=len(quotes))
             return []
@@ -187,12 +206,31 @@ class ExecutionGateway:
         return OpenOrder(oid, q.token_id, q.side, q.price, q.size, OrderState.LIVE)
 
     def _parse_place_response(self, resp: Any, quotes: list[Quote]) -> list[OpenOrder]:
-        """Map a batch post response to OpenOrders. Tolerant of shape variants;
-        the user-WS order events + REST snapshot reconcile anything we miss."""
-        items = resp if isinstance(resp, list) else resp.get("orders", resp.get("data", []))
+        """Map a batch post response to OpenOrders. Tolerates both the unified
+        SDK's AcceptedOrder/RejectedOrder models and legacy dict shapes; rejected
+        orders (no id) are logged and skipped — the engine quarantines on a
+        partial batch. The user-WS order events + REST snapshot reconcile the rest.
+        """
+        if isinstance(resp, dict):
+            items: Any = resp.get("orders", resp.get("data", []))
+        elif isinstance(resp, (list, tuple)):
+            items = resp
+        else:
+            items = []
         out: list[OpenOrder] = []
-        for q, item in zip(quotes, items if isinstance(items, list) else [], strict=False):
-            oid = _first(item, "orderID", "orderId", "order_id", "id", "hash")
+        for q, item in zip(quotes, items, strict=False):
+            if isinstance(item, dict):
+                oid = _first(item, "orderID", "orderId", "order_id", "id", "hash")
+                err = str(item.get("errorMsg") or item.get("message") or "")
+            else:
+                # unified SDK AcceptedOrder / RejectedOrder models
+                oid = getattr(item, "order_id", None)
+                ok = getattr(item, "ok", True)
+                err = "" if ok else str(getattr(item, "message", "") or getattr(item, "code", ""))
+            if err and err not in ("", "None"):
+                log.warning("order_rejected", err=err[:200], side=q.side.value,
+                            price=q.price, size=q.size)
+                continue
             if not oid:
                 log.warning("place_response_missing_id", item=str(item)[:120])
                 continue
@@ -207,11 +245,8 @@ class ExecutionGateway:
             return True
         await self._cancel_bucket.acquire(1)
 
-        def _cancel() -> None:
-            self._client.cancel_orders(order_ids)
-
         try:
-            await self._io(_cancel)
+            await self._client.cancel_orders(order_ids=order_ids)
             return True
         except Exception as exc:  # noqa: BLE001
             log.error("cancel_failed", err=str(exc), n=len(order_ids))
@@ -222,13 +257,8 @@ class ExecutionGateway:
         if self._paper:
             return True
 
-        def _cancel() -> None:
-            from py_clob_client_v2.clob_types import OrderMarketCancelParams
-
-            self._client.cancel_market_orders(OrderMarketCancelParams(asset_id=asset_id))
-
         try:
-            await self._io(_cancel)
+            await self._client.cancel_market_orders(asset_id=asset_id)
             return True
         except Exception as exc:  # noqa: BLE001
             log.error("cancel_asset_failed", err=str(exc), token=asset_id[:12])
@@ -237,41 +267,34 @@ class ExecutionGateway:
     async def cancel_all(self) -> None:
         if self._paper or self._client is None:
             return
-        await self._io(self._client.cancel_all)
+        await self._client.cancel_all()
         log.info("cancel_all_sent")
 
     # ── market (taker) orders — used by moneydoctor, NOT the maker strategy ──
     async def market_order(
         self, token_id: str, side: Side, amount: float, meta: MarketMeta,
         *, fak: bool = True,
-    ) -> dict[str, Any]:
+    ) -> Any:
         """Place a marketable order. amount = USD for BUY, shares for SELL.
 
         This is a TAKER order (crosses the spread) — only the moneydoctor live
-        self-test uses it; the maker strategy never does.
+        self-test uses it; the maker strategy never does. Returns the unified
+        SDK's AcceptedOrder/RejectedOrder (or a dict on failure).
         """
         if self._paper or self._client is None:
             return {"paper": True}
 
-        def _do() -> dict[str, Any]:
-            from py_clob_client_v2.clob_types import (
-                MarketOrderArgsV2,
-                OrderType,
-                PartialCreateOrderOptions,
+        order_type = "FAK" if fak else "FOK"
+        try:
+            if side is Side.BUY:
+                return await self._client.place_market_order(
+                    token_id=token_id, side="BUY", amount=amount, order_type=order_type,
+                )
+            return await self._client.place_market_order(
+                token_id=token_id, side="SELL", shares=amount, order_type=order_type,
             )
-
-            ot = OrderType.FAK if fak else OrderType.FOK
-            args = MarketOrderArgsV2(token_id=token_id, amount=amount,
-                                     side=side.value, order_type=ot)
-            opts = PartialCreateOrderOptions(tick_size=_tick_str(meta.tick_size),
-                                             neg_risk=meta.neg_risk)
-            try:
-                resp = self._client.create_and_post_market_order(args, opts, order_type=ot)
-                return resp if isinstance(resp, dict) else {"resp": resp}
-            except Exception as exc:  # noqa: BLE001 - surface as data, never crash the caller
-                return {"status": "failed", "error": str(exc)}
-
-        return await self._io(_do)
+        except Exception as exc:  # noqa: BLE001 - surface as data, never crash the caller
+            return {"status": "failed", "error": str(exc)}
 
     async def get_book(self, token_id: str) -> dict[str, float]:
         """Live best bid/ask + touch depth for one token (public REST)."""
@@ -399,41 +422,55 @@ class ExecutionGateway:
     async def collateral_balance(self) -> float:
         """pUSD balance (float) on the funder."""
         ba = await self.balance_allowance()
-        for k in ("balance", "collateral", "amount"):
-            if isinstance(ba, dict) and k in ba:
-                try:
-                    v = float(ba[k])
-                    return v / 1e6 if v > 1e6 else v
-                except (ValueError, TypeError):
-                    return 0.0
+        if isinstance(ba, dict):
+            for k in ("balance", "collateral", "amount"):
+                if k in ba:
+                    try:
+                        v = float(ba[k])
+                        return v / 1e6 if v > 1e6 else v
+                    except (ValueError, TypeError):
+                        return 0.0
+        # unified SDK BalanceAllowance model: raw-unit int balance
+        bal = getattr(ba, "balance", None)
+        if bal is not None:
+            try:
+                v = float(bal)
+                return v / 1e6 if v > 1e6 else v
+            except (ValueError, TypeError):
+                return 0.0
         return 0.0
 
     # ── heartbeat (dead-man switch) ─────────────────────────────────────
-    async def heartbeat(self) -> bool:
-        """Send one chained heartbeat. Returns True on success.
+    def _beat_once(self) -> bool:
+        """Single heartbeat attempt.
 
-        The exchange expects each heartbeat to carry the previous heartbeat_id.
-        Consecutive failures are tracked in `heartbeat_failures`: after enough
-        misses the exchange auto-cancels ALL our orders, so the engine must
-        stop quoting and resync once the heartbeat recovers.
+        NOTE: the stateless L2-signed ``POST /heartbeats`` migration lands in
+        the next change-set (requirement 2). Until then this fails CLOSED — the
+        engine halts quoting rather than quoting with a dead safety net. Paper
+        mode bypasses this entirely.
+        """
+        return False
+
+    async def heartbeat(self) -> bool:
+        """Send one heartbeat tick. Returns True on success.
+
+        Consecutive failures are tracked in `heartbeat_failures`; after enough
+        misses the exchange auto-cancels ALL our orders, so the engine must stop
+        quoting and resync once the heartbeat recovers.
         """
         if self._paper or self._client is None:
             return True
 
-        def _beat() -> Any:
-            return self._client.post_heartbeat(self._hb_id)
-
         try:
-            resp = await self._io(_beat)
-            new_id = _first(resp, "heartbeat_id", "heartbeatId", "id")
-            self._hb_id = str(new_id) if new_id else ""
+            ok = await self._io(self._beat_once)
+            if not ok:
+                raise RuntimeError("heartbeat not acknowledged by exchange")
             if self._hb_failures:
                 log.info("heartbeat_recovered", after_failures=self._hb_failures)
             self._hb_failures = 0
             return True
         except Exception as exc:  # noqa: BLE001
             self._hb_failures += 1
-            self._hb_id = ""  # broken chain — restart it
             log.warning("heartbeat_failed", err=str(exc), consecutive=self._hb_failures)
             return False
 
@@ -446,72 +483,59 @@ class ExecutionGateway:
         if self._paper or self._client is None:
             return []
 
-        def _get() -> list[OpenOrder]:
-            raw = self._client.get_open_orders()
-            rows = raw if isinstance(raw, list) else raw.get("data", raw.get("orders", []))
-            out = []
-            for r in rows:
+        try:
+            pages = self._client.list_open_orders()
+            out: list[OpenOrder] = []
+            async for r in pages.iter_items():
                 try:
-                    side = Side(str(r["side"]).upper())
-                    remaining = float(r.get("original_size", r.get("size", 0))) - float(
-                        r.get("size_matched", 0)
-                    )
+                    side = Side(str(r.side).upper())
+                    remaining = float(r.original_size) - float(r.size_matched)
                     out.append(
                         OpenOrder(
-                            str(_first(r, "id", "orderID", "order_id")),
-                            str(r["asset_id"]),
+                            str(r.id),
+                            str(r.asset_id),
                             side,
-                            float(r["price"]),
+                            float(r.price),
                             remaining,
                             OrderState.LIVE,
                         )
                     )
-                except (KeyError, ValueError, TypeError):
+                except (ValueError, TypeError):
                     continue
             return out
-
-        try:
-            return await self._io(_get)
         except Exception as exc:  # noqa: BLE001
             log.warning("open_orders_failed", err=str(exc))
             return []
 
     async def positions(self) -> dict[str, tuple[float, float]]:
-        """{token_id: (size, avg_price)} from the data API (reconcile use).
+        """{token_id: (size, avg_price)} from the Data API (reconcile use).
 
-        Queries the FUNDER (where positions live), not the signer EOA.
+        Queries the FUNDER (where positions live), not the signer EOA, via the
+        unified SDK's paginated ``list_positions``.
         """
+        if self._paper or self._client is None:
+            return {}
         user = self.funder
         if not user or not user.startswith("0x") or user == "0xPAPER":
             return {}
         try:
-            async with httpx.AsyncClient(timeout=15.0) as c:
-                r = await c.get(f"{self._data_host}/positions", params={"user": user})
-                r.raise_for_status()
-                return {
-                    str(p["asset"]): (float(p["size"]), float(p.get("avgPrice", 0)))
-                    for p in r.json()
-                    if float(p.get("size", 0)) > 0
-                }
-        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            pages = self._client.list_positions(user=user)
+            out: dict[str, tuple[float, float]] = {}
+            async for p in pages.iter_items():
+                size = float(p.current_size)
+                if size > 0:
+                    out[str(p.asset_id)] = (size, float(p.avg_price or 0))
+            return out
+        except Exception as exc:  # noqa: BLE001
             log.warning("positions_failed", err=str(exc))
             return {}
 
-    async def balance_allowance(self) -> dict[str, Any]:
+    async def balance_allowance(self) -> Any:
         """Collateral balance/allowance snapshot (for `doctor`)."""
         if self._client is None:
             return {}
-
-        def _get() -> dict[str, Any]:
-            from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
-
-            result: dict[str, Any] = self._client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            return result
-
         try:
-            return await self._io(_get)
+            return await self._client.get_balance_allowance(asset_type="COLLATERAL")
         except Exception as exc:  # noqa: BLE001
             log.warning("balance_allowance_failed", err=str(exc))
             return {}

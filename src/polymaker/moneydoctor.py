@@ -175,8 +175,8 @@ async def _wait_settled(cfg: Config, gw: ExecutionGateway, token: str, baseline:
             async with websockets.connect(USER_WS, **kw) as ws:  # type: ignore[arg-type]
                 await ws.send(json.dumps({
                     "type": "user",
-                    "auth": {"apiKey": creds.api_key, "secret": creds.api_secret,
-                             "passphrase": creds.api_passphrase},
+                    "auth": {"apiKey": creds.key, "secret": creds.secret,
+                             "passphrase": creds.passphrase},
                     "markets": [],
                 }))
                 while not done.is_set():
@@ -228,9 +228,17 @@ def _fill(resp: object, side: Side) -> tuple[float, float, str]:
 
     makingAmount = what we give, takingAmount = what we get. So for a BUY,
     shares = takingAmount and usd = makingAmount; for a SELL it's the reverse.
+    Handles both the unified SDK's AcceptedOrder model (snake_case) and the
+    legacy camelCase dict shape.
     """
     if not isinstance(resp, dict):
-        return 0.0, 0.0, "?"
+        # unified SDK AcceptedOrder / RejectedOrder models
+        status = str(getattr(resp, "status", "") or getattr(resp, "code", ""))
+        making = _f(getattr(resp, "making_amount", None))
+        taking = _f(getattr(resp, "taking_amount", None))
+        if not getattr(resp, "ok", True):
+            return 0.0, 0.0, status or "rejected"
+        return (taking, making, status) if side is Side.BUY else (making, taking, status)
     status = str(resp.get("status", ""))
     making = _f(resp.get("makingAmount"))
     taking = _f(resp.get("takingAmount"))
