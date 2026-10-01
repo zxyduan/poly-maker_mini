@@ -75,6 +75,7 @@ class Engine:
         self.regime_m: dict[str, RegimeMachine] = {}
         self._dirty: dict[str, asyncio.Event] = {}
         self._sweep: dict[str, bool] = {}
+        self._soft_streak: dict[str, int] = {} # 每个市场连续软错次数；resync 一直治不好就升级成硬失败。
         self._merging: set[str] = set()
         self._token_cid: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
@@ -105,7 +106,7 @@ class Engine:
         # subscribe feeds
         self.md.set_markets([(cid, [m.yes.token_id, m.no.token_id]) for cid, m in self.metas.items()])
         self.user = UserStream(
-            self.gateway.creds, self.gateway.address, self.user_proc,
+            self.gateway.creds, self.gateway.funder, self.user_proc,
             other_token=self._other_token, condition_of_token=self._cid_of_token,
             journal=self.journal, proxy=self.cfg.proxy,
             on_reconnect=self._on_user_reconnect,
@@ -499,14 +500,32 @@ class Engine:
             else:
                 placed = await self.gateway.place(plan.to_place, meta)
                 placed_n = len(placed)
-                self.risk.note_order_result(len(placed) == len(plan.to_place))
                 for o in placed:
                     self.state.upsert_order(o)
-                if len(placed) < len(plan.to_place):
-                    # QUARANTINE: a failed/partial batch may still have posted
-                    # orders we don't have ids for. Cancel everything on these
-                    # tokens (idempotent) and resync — never risk an untracked order.
-                    await self._quarantine(meta, reason="place_incomplete")
+                soft = getattr(self.gateway, "soft_rejections", [])
+                if soft:
+                    streak = self._soft_streak.get(cid, 0) + 1
+                    self._soft_streak[cid] = streak
+                    if streak >= 5:
+                        # resync 5 次还在软错，升级硬失败让熔断介入
+                        log.error("soft_rejection_stuck", cid=cid[:8], streak=streak)
+                        self.risk.note_order_result(False)
+                        await self._quarantine(meta, reason="soft_rejection_stuck")
+                    else:
+                        # state 延迟：resync 挂单，下一 tick 再算
+                        log.warning("soft_rejection_resync", cid=cid[:8],
+                                    n=len(soft), streak=streak)
+                        self.risk.note_order_result(True)
+                        await self._refresh_token_orders(meta, grace_s=10.0)
+                        self._dirty[cid].set()
+                else:
+                    self._soft_streak[cid] = 0
+                    if len(placed) < len(plan.to_place):
+                        self.risk.note_order_result(False)
+                        await self._quarantine(meta, reason="place_incomplete")
+                    else:
+                        self.risk.note_order_result(True)
+
         self._last_quote_fv[cid] = fv
         log.info("requote", cid=cid[:8], regime=regime.value, fv=round(fv, 4),
                  place=placed_n, cancel=len(plan.to_cancel),

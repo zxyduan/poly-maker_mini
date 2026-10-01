@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import itertools
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +60,7 @@ class ExecutionGateway:
         self._cancel_bucket = TokenBucket(rate_per_s=200.0 * f, burst=500.0 * f)
         self._paper_ids = itertools.count(1)
         self._hb_failures: int = 0
+        self.soft_rejections: list[str] = [] #本批次里"自己挂单锁了额度"的软拒单；engine resync 而不是 quarantine。
         # dedicated, bounded pool for the blocking on-chain web3 balance reads,
         # so they can't starve the asyncio event loop.
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="clob-io")
@@ -178,6 +180,7 @@ class ExecutionGateway:
             return []
         await self._order_bucket.acquire(len(quotes))
         ts = time.time()
+        self.soft_rejections = [] #清理软错误信息
         self._journal_write("orders_out", [asdict(q) for q in quotes], ts)
 
         if self._paper:
@@ -229,8 +232,12 @@ class ExecutionGateway:
                 ok = getattr(item, "ok", True)
                 err = "" if ok else str(getattr(item, "message", "") or getattr(item, "code", ""))
             if err and err not in ("", "None"):
-                log.warning("order_rejected", err=err[:200], side=q.side.value,
+                soft = self._is_state_lag_rejection(err)
+                log.warning("order_rejected_soft" if soft else "order_rejected",
+                            err=err[:200], side=q.side.value,
                             price=q.price, size=q.size)
+                if soft:
+                    self.soft_rejections.append(err[:120])
                 continue
             if not oid:
                 log.warning("place_response_missing_id", item=str(item)[:120])
@@ -238,6 +245,12 @@ class ExecutionGateway:
             out.append(OpenOrder(str(oid), q.token_id, q.side, q.price, q.size, OrderState.LIVE))
         return out
 
+    @staticmethod
+    def _is_state_lag_rejection(err: str) -> bool:
+        """'sum of matched orders: N>0' = 自己挂单锁了额度，不是真没钱。"""
+        m = re.search(r"sum of matched orders:\s*(\d+)", err, re.IGNORECASE)
+        return m is not None and int(m.group(1)) > 0
+    
     # ── cancellation ────────────────────────────────────────────────────
     async def cancel(self, order_ids: list[str]) -> bool:
         """Cancel by id. Returns True on success — callers must NOT drop the
