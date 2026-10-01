@@ -87,21 +87,69 @@ exit_urgency_s      = 900
 merge_min_size      = 20.0
 
 
-# one-way accumulator example: rest BUY bids under book walls on a single side.
-# Select by setting a market's `profile = "yes-pyramid"` in markets.toml.
+# one-way accumulator: 在单一方向（Yes 或 No）的订单簿下方挂金字塔型 BUY 买单积累仓位
+# 有仓位时挂 SELL 卖单退出（被动挂在 ask 下方一档）
+# 在 markets.toml 里把 profile 设为 "one_way" 启用
 [profiles.one_way]
 type = "one_way"
+
+# ── 方向选择 ──
+# ow_side: 做哪一侧的 accumulator
+#   "yes" → 只在 Yes token 上挂 BUY（赌 Yes 概率上升）
+#   "no"  → 只在 No token 上挂 BUY（赌 No 概率上升）
 ow_side = "yes"
-# shared knobs (same as maker)
+
+# ── 通用规模参数 ──
+# base_size_usdc: 金字塔总规模（USDC），按 ow_pyramid_shares 的权重分配到各层
+#   例: base_size_usdc=30, shares=[0.1,0.2,0.3,0.4] → 4层分别是 $3/$6/$9/$12
 base_size_usdc = 30.0
+
+# q_max_usdc: 最大持仓名义价值（USDC），用于计算仓位利用率
+#   util = held_shares * fv / q_max_usdc
+#   util < ow_inv_low  → 满仓买
+#   util < ow_inv_mid  → 半仓买
+#   util >= ow_inv_mid → 停止加仓
 q_max_usdc = 60.0
-event_cooloff_s = 60.0
-# one-way knobs
+
+# event_cooloff_s: 事件触发后冷却多少秒才恢复报价
+#   防止市场剧烈波动时频繁重挂
+event_cooloff_s = 360.0
+
+# ── 金字塔结构参数 ──
+# ow_pyramid_shares: 各层权重，加起来必须等于 1
+#   从下往上（离 touch 从近到远）逐层加权：越远的墙挂得越多
+#   推荐: [0.1, 0.2, 0.3, 0.4]（近小远大，底部金字塔形态）
 ow_pyramid_shares = [0.10, 0.20, 0.30, 0.40]
+
+# ow_wall_pct_of_24h: 什么算"墙"？24h 成交量的百分比
+#   只在订单簿上找名义价值 >= 24h_volume * 这个比例 的价位作为墙
+#   例: 0.005 → 24h 成交量的 0.5% 以上的价位才算墙
 ow_wall_pct_of_24h = 0.005
+
+# ow_wall_skip_ticks: 第一层墙离 touch 跳几跳
+#   第一层 BUY 挂在 best_bid 下方 N 跳的墙上面
+#   例: 1 → 找 best_bid 下方第 1 个符合条件的墙
 ow_wall_skip_ticks = 1
+
+# ow_wall_min_gap_ticks: 相邻两层之间最少隔几跳
+#   防止层与层挤在一起
+#   例: 5 → 每层之间至少隔 5 跳
 ow_wall_min_gap_ticks = 5
+
+# ── 仓位利用率阈值 ──
+# ow_inv_low: 利用率低于这个值 → 满仓加仓
 ow_inv_low = 0.33
+
+# ow_inv_mid: 利用率超过这个值 → 停止加仓
+#   中间区间（0.33~0.66）→ 半仓加仓
 ow_inv_mid = 0.66
+
+# ── 风控参数 ──
+# ow_panic_toxicity: toxicity 超过这个值 → 恐慌模式
+#   恐慌模式下 SELL 退出单直接挂到 best_bid + 1跳（吃 bid 快速离场）
 ow_panic_toxicity = 0.6
+
+# ow_exit_days_before: 离到期还有多少天开始只卖不买
+#   临近到期时方向不确定性大，只退出不开新仓
+#   例: 30.0 → 到期前 30 天开始 sell-only
 ow_exit_days_before = 30.0
