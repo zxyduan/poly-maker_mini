@@ -275,7 +275,7 @@ def cancel_all(config_dir: str = typer.Option("config", help="config directory")
     console.print("[green]Sent cancel-all.[/green]")
 
 
-# ── Daily stats collector ────────────────────────────────────────────────
+# ── Snapshot collector ────────────────────────────────────────────────────
 
 
 async def _resolve_market_ids(slug: str, gamma_host: str) -> tuple[str, str] | None:
@@ -295,22 +295,22 @@ async def _resolve_market_ids(slug: str, gamma_host: str) -> tuple[str, str] | N
         return condition_id, yes_token_id
 
 
-@app.command(name="stats-collector")
-def stats_collector(
+@app.command(name="snapshot-collector")
+def snapshot_collector(
     config_dir: str = typer.Option("config", help="config directory"),
-    interval: int = typer.Option(3600, help="采集间隔秒数（默认 3600 = 1 小时）"),
+    interval: int = typer.Option(7200, help="采集间隔秒数（默认 7200 = 2 小时）"),
     once: bool = typer.Option(False, "--once", help="只跑一次不循环"),
 ) -> None:
-    """启动每日统计采集器（独立后台进程，每小时跑一次）。"""
-    from polymaker.catalog.daily_stats import DailyStatsCollector, DailyStatsStore
+    """启动2小时快照采集器（独立后台进程）。"""
+    from polymaker.catalog.snapshots import SnapshotCollector, SnapshotStore
     from polymaker.logging import configure
     import signal
 
     cfg = Config.load(config_dir)
-    configure(json_file=Path(cfg.paths.log_dir) / "stats-collector.jsonl")
+    configure(json_file=Path(cfg.paths.log_dir) / "snapshot-collector.jsonl")
 
-    store = DailyStatsStore(cfg.paths.db)
-    collector = DailyStatsCollector(store)
+    store = SnapshotStore(cfg.paths.db)
+    collector = SnapshotCollector(store)
 
     async def _run_cycle() -> None:
         """跑一轮所有 enabled 市场的采集。"""
@@ -323,10 +323,8 @@ def stats_collector(
         for m in markets:
             slug = m.slug or m.condition_id or "?"
             try:
-                # 解析 condition_id 和 token_id
                 if m.condition_id:
                     condition_id = m.condition_id
-                    # 需要 yes_token_id，从 Gamma 查
                     ids = await _resolve_market_ids(slug, cfg.wallet.gamma_host)
                     if ids is None:
                         console.print(f"[red]找不到市场 {slug}[/red]")
@@ -341,19 +339,23 @@ def stats_collector(
 
                 await collector.collect(condition_id, yes_token_id)
 
-                # 打印一条简洁的日志
+                # 打印简洁日志
                 rows = store.history(condition_id, limit=1)
                 if rows:
                     r = rows[0]
-                    vol_str = f"${r.volume_usdc:>10,.0f}" if r.volume_usdc > 0 else "         -"
-                    range_str = f"{r.range_pct*100:.1f}%" if r.range_pct is not None else "-"
-                    console.print(f"  [green]✓[/green] {slug[:40]:<40} vol={vol_str} range={range_str}")
+                    trend_icon = {"up": "📈", "down": "📉", "flat": "➡️"}.get(r.trend, "⚪")
+                    dd_str = f"{r.drawdown_from_high*100:.1f}%" if r.drawdown_from_high != 0 else "-"
+                    console.print(
+                        f"  {trend_icon} {slug[:36]:<36} "
+                        f"close={r.price_close:.4f} "
+                        f"dd={dd_str} "
+                        f"depth={r.bid_depth_top5:>8,.0f}"
+                    )
             except Exception as exc:
-                console.print(f"  [red]✗[/red] {slug[:40]:<40} {exc}")
+                console.print(f"  [red]✗[/red] {slug[:36]:<36} {exc}")
 
     async def _loop() -> None:
-        """主循环：每 interval 秒跑一次。"""
-        # 捕获 Ctrl+C
+        """主循环。"""
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -363,94 +365,86 @@ def stats_collector(
         while not stop.is_set():
             cycle += 1
             now = datetime.now().strftime("%H:%M:%S")
-            console.print(f"\n[bold cyan]=== 第 {cycle} 轮采集 {now} ===[/bold cyan]")
+            console.print(f"\n[bold cyan]=== 快照采集 第 {cycle} 轮 {now} ===[/bold cyan]")
             await _run_cycle()
 
             if once:
                 break
 
-            # 等 interval 秒，或者收到停止信号
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except asyncio.TimeoutError:
-                pass  # 超时了，继续下一轮
+                pass
 
         await collector.aclose()
         store.close()
-        console.print("\n[yellow]采集器已停止。[/yellow]")
+        console.print("\n[yellow]快照采集器已停止。[/yellow]")
 
-    from datetime import datetime
-    console.print(f"[bold green]启动 stats-collector[/bold green] 间隔={interval}s")
+    console.print(f"[bold green]启动 snapshot-collector[/bold green] 间隔={interval}s")
     try:
         asyncio.run(_loop())
     except KeyboardInterrupt:
         console.print("\n[yellow]手动停止。[/yellow]")
 
 
-@app.command(name="stats")
-def stats(
+@app.command(name="snapshots")
+def snapshots(
     slug: str = typer.Argument(..., help="市场 slug"),
     config_dir: str = typer.Option("config", help="config directory"),
-    days: int = typer.Option(14, help="显示最近 N 天"),
+    buckets: int = typer.Option(24, help="显示最近 N 个桶"),
 ) -> None:
-    """查某个市场的每日统计数据。"""
-    from polymaker.catalog.daily_stats import DailyStatsStore
+    """查某个市场的2小时快照数据。"""
+    from polymaker.catalog.snapshots import SnapshotStore
 
     cfg = Config.load(config_dir)
-    store = DailyStatsStore(cfg.paths.db)
+    store = SnapshotStore(cfg.paths.db)
 
     # 先解析 condition_id
     async def _resolve() -> str | None:
-        import json as _json
-        import httpx
-
-        async with httpx.AsyncClient(base_url=cfg.wallet.gamma_host, timeout=15.0) as client:
-            r = await client.get("/markets", params={"slug": slug, "limit": 1})
-            r.raise_for_status()
-            data = r.json()
-            return data[0]["conditionId"] if data else None
+        ids = await _resolve_market_ids(slug, cfg.wallet.gamma_host)
+        return ids[0] if ids else None
 
     condition_id = asyncio.run(_resolve())
     if condition_id is None:
         console.print(f"[red]找不到市场 {slug}[/red]")
         raise typer.Exit(1)
 
-    rows = store.history(condition_id, limit=days)
+    rows = store.history(condition_id, limit=buckets)
     if not rows:
-        console.print("[yellow]还没有数据，先跑一次 stats-collector。[/yellow]")
+        console.print("[yellow]还没有快照数据，先跑一次 snapshot-collector。[/yellow]")
         raise typer.Exit()
 
-    table = Table(title=f"日统计: {slug}")
-    table.add_column("日期")
-    table.add_column("成交量", justify="right")
-    table.add_column("开盘", justify="right")
-    table.add_column("最高", justify="right")
-    table.add_column("最低", justify="right")
+    table = Table(title=f"2小时快照: {slug}")
+    table.add_column("时间桶")
     table.add_column("收盘", justify="right")
-    table.add_column("振幅", justify="right")
-    table.add_column("状态")
+    table.add_column("趋势", justify="center")
+    table.add_column("连向", justify="right")
+    table.add_column("回撤", justify="right")
+    table.add_column("分位", justify="right")
+    table.add_column("买盘深度", justify="right")
+    table.add_column("深度变化", justify="right")
+    table.add_column("波动", justify="center")
 
     for r in rows:
-        vol = f"${r.volume_usdc:,.0f}" if r.volume_usdc > 0 else "-"
-        rng = f"{r.range_pct*100:.1f}%" if r.range_pct is not None else "-"
-        status = "今天" if not r.frozen else "✓"
+        dt = datetime.fromtimestamp(r.bucket_ts, tz=timezone.utc).strftime("%m-%d %H:00")
+        trend_icon = {"up": "📈", "down": "📉", "flat": "➡️"}.get(r.trend, "?")
+        dd = f"{r.drawdown_from_high*100:.1f}%" if r.drawdown_from_high != 0 else "-"
+        pct = f"{r.price_percentile*100:.0f}%" if r.price_percentile != 0.5 else "-"
+        depth_chg = f"{r.bid_depth_change*100:+.0f}%" if r.bid_depth_change != 0 else "-"
+
         table.add_row(
-            r.date, vol,
-            f"{r.price_open:.4f}" if r.price_open else "-",
-            f"{r.price_high:.4f}" if r.price_high else "-",
-            f"{r.price_low:.4f}" if r.price_low else "-",
-            f"{r.price_close:.4f}" if r.price_close else "-",
-            rng, status,
+            dt,
+            f"{r.price_close:.4f}",
+            trend_icon,
+            f"{r.trend_streak:+d}",
+            dd,
+            pct,
+            f"${r.bid_depth_top5:,.0f}",
+            depth_chg,
+            r.vol_regime or "-",
         )
 
     console.print(table)
-
-    # 打印 recent_avg（路由用的）
-    avg_vol, avg_range = store.recent_avg(condition_id, days=3)
-    console.print(f"\n[bold]3 日均值（路由判断用）:[/bold]")
-    console.print(f"  平均成交量: ${avg_vol:,.2f}")
-    console.print(f"  平均振幅:   {avg_range*100:.2f}%")
-
     store.close()
 
 
