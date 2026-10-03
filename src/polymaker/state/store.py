@@ -42,6 +42,53 @@ CREATE TABLE IF NOT EXISTS pnl_snapshots (
     ts        REAL PRIMARY KEY,
     equity    REAL, net_cash REAL, inventory_value REAL, daily_pnl REAL
 );
+
+-- 下单时的决策环境快照：事后分析"这笔单挂得合不合理"
+CREATE TABLE IF NOT EXISTS order_context (
+    order_id         TEXT PRIMARY KEY,
+    condition_id     TEXT NOT NULL,
+    token_id         TEXT NOT NULL,
+    side             TEXT NOT NULL,          -- BUY / SELL
+    price            REAL NOT NULL,
+    size             REAL NOT NULL,
+
+    -- 决策时的市场环境
+    regime           TEXT NOT NULL,          -- QUIET / TRENDING / EVENT / ...
+    fv               REAL NOT NULL,          -- 当时 YES 的公允价值
+    vol_short        REAL,
+    vol_ratio        REAL,
+    toxicity         REAL,
+    flow_z           REAL,
+    inventory_util   REAL,
+    risk_size_scale  REAL,
+
+    -- 盘口状态（YES 侧）
+    yes_best_bid     REAL,
+    yes_best_ask     REAL,
+    our_offset_ticks REAL,                 -- 本单价格离 best_bid 几跳（买单=负方向=压价多少）
+
+    -- 库存快照
+    pos_yes_size     REAL,
+    pos_no_size      REAL,
+
+    -- 策略参数快照（事后能复算为什么挂这个价/量）
+    strategy_type    TEXT,                  -- maker / one_way
+    base_size_usdc   REAL,
+    q_max_usdc       REAL,
+    vol_factor       REAL,                  -- adaptive 系数
+    vol_regime_factor REAL,
+
+    placed_ts        REAL NOT NULL,
+
+    -- 结果（后续回填）
+    fill_price       REAL,
+    fill_size        REAL,
+    fill_ts          REAL,
+    canceled_ts      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_orderctx_cid_time ON order_context(condition_id, placed_ts DESC);
+CREATE INDEX IF NOT EXISTS idx_orderctx_side ON order_context(condition_id, side);
+CREATE INDEX IF NOT EXISTS idx_orderctx_filled ON order_context(fill_ts) WHERE fill_ts IS NOT NULL;
 """
 
 
@@ -240,6 +287,72 @@ class StateStore:
         self.set_position(token_id, size, avg_price)
         log.warning("position_forced", token=token_id[:12], source=source,
                     prev=round(prev.size, 2) if prev else 0.0, now=round(size, 2))
+
+    # ── order context snapshots ───────────────────────────────────────
+    def record_order_context(self, oid: str, *, cid: str, token_id: str, side: str,
+                             price: float, size: float, regime: str, fv: float,
+                             vol_short: float | None, vol_ratio: float | None,
+                             toxicity: float | None, flow_z: float | None,
+                             inventory_util: float | None, risk_size_scale: float | None,
+                             yes_best_bid: float | None, yes_best_ask: float | None,
+                             our_offset_ticks: float | None,
+                             pos_yes_size: float, pos_no_size: float,
+                             strategy_type: str | None, base_size_usdc: float | None,
+                             q_max_usdc: float | None,
+                             vol_factor: float | None, vol_regime_factor: float | None,
+                             placed_ts: float) -> None:
+        """记录一笔下单时的完整决策环境快照。幂等：同一 order_id 不重复插。"""
+        self._conn.execute(
+            """INSERT OR IGNORE INTO order_context(
+                order_id, condition_id, token_id, side, price, size,
+                regime, fv, vol_short, vol_ratio, toxicity, flow_z,
+                inventory_util, risk_size_scale,
+                yes_best_bid, yes_best_ask, our_offset_ticks,
+                pos_yes_size, pos_no_size,
+                strategy_type, base_size_usdc, q_max_usdc,
+                vol_factor, vol_regime_factor, placed_ts
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (oid, cid, token_id, side, price, size,
+             regime, fv, vol_short, vol_ratio, toxicity, flow_z,
+             inventory_util, risk_size_scale,
+             yes_best_bid, yes_best_ask, our_offset_ticks,
+             pos_yes_size, pos_no_size,
+             strategy_type, base_size_usdc, q_max_usdc,
+             vol_factor, vol_regime_factor, placed_ts),
+        )
+        self._conn.commit()
+
+    def mark_order_filled(self, order_id: str, *, price: float, size: float, ts: float) -> None:
+        """回填某笔订单的成交结果。只更新还没记成交的行。"""
+        self._conn.execute(
+            "UPDATE order_context SET fill_price=?, fill_size=?, fill_ts=? "
+            "WHERE order_id=? AND fill_ts IS NULL",
+            (price, size, ts, order_id),
+        )
+        self._conn.commit()
+
+    def mark_order_canceled(self, order_id: str, *, ts: float) -> None:
+        """回填某笔订单被撤单的时间。"""
+        self._conn.execute(
+            "UPDATE order_context SET canceled_ts=? WHERE order_id=? AND canceled_ts IS NULL",
+            (ts, order_id),
+        )
+        self._conn.commit()
+
+    def mark_all_unfilled_as_canceled(self, *, now: float) -> None:
+        """引擎重启时批量标记：所有还没成交也没标记撤单的旧单，统一算"重启时结束"。
+
+        理由：重启后 cancel_all 清了场，本地不再追踪这些单；从分析角度看
+        它们的最终状态就是"引擎重启时不再挂着了"，不该永远显示"挂着"。
+        """
+        cur = self._conn.execute(
+            "UPDATE order_context SET canceled_ts=? "
+            "WHERE fill_ts IS NULL AND canceled_ts IS NULL",
+            (now,),
+        )
+        self._conn.commit()
+        if cur.rowcount > 0:
+            log.info("bulk_canceled_on_restart", n=cur.rowcount)
 
     # ── maintenance / reporting ─────────────────────────────────────────
     def checkpoint_wal(self) -> None:

@@ -42,6 +42,8 @@ class AdaptiveResult:
 
     profile: OneWayProfile     # 调整后的 profile
     just_switched: bool        # 这次是不是刚切换了模式（保守↔正常）
+    vol_factor: float = 1.0            # 当前成交量系数
+    vol_regime_factor: float = 1.0     # 当前波动率系数
 
 
 class AdaptiveCache:
@@ -274,7 +276,11 @@ class AdaptiveEngine:
                     vol_factor=factors.vol_factor,
                     vol_regime_factor=factors.vol_regime_factor,
                 )
-                return AdaptiveResult(profile=profile, just_switched=False)
+                return AdaptiveResult(
+                    profile=profile, just_switched=False,
+                    vol_factor=factors.vol_factor,
+                    vol_regime_factor=factors.vol_regime_factor,
+                )
 
         # 重新计算系数
         factors = self._calc_factors(condition_id)
@@ -297,7 +303,11 @@ class AdaptiveEngine:
             vol_factor=factors.vol_factor,
             vol_regime_factor=factors.vol_regime_factor,
         )
-        return AdaptiveResult(profile=profile, just_switched=just_switched)
+        return AdaptiveResult(
+            profile=profile, just_switched=just_switched,
+            vol_factor=factors.vol_factor,
+            vol_regime_factor=factors.vol_regime_factor,
+        )
 
     def _calc_factors(self, condition_id: str) -> MarketFactors:
         """从数据库读快照数据，算两个系数。"""

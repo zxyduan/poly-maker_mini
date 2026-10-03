@@ -99,6 +99,9 @@ class Engine:
         self._locks: dict[str, asyncio.Lock] = {}  # per-market: serialize recompute vs reconcile
         self._halted: set[str] = set()  # markets closed/resolved/not-accepting
         self._last_quote_fv: dict[str, float] = {}  # requote suppression
+        # 当前市场的 adaptive 系数（用于 order_context 快照）
+        self._cur_vol_factor: dict[str, float] = {}
+        self._cur_vol_regime_factor: dict[str, float] = {}
         # supervised tasks: name -> (factory, task) so a dead task restarts
         self._task_specs: dict[str, Any] = {}
         self._tasks: dict[str, asyncio.Task[Any]] = {}
@@ -279,6 +282,10 @@ class Engine:
             self.state.reconcile_positions(positions)
             log.info("startup_positions", n=len(positions))
 
+        # ★ 重启清场：上一轮引擎挂的单要么被 cancel_all 撤了，要么还在交易所但本地已不认识。
+        #   从分析角度统一标记为"引擎重启时结束"，避免历史订单永远显示"挂着"。
+        self.state.mark_all_unfilled_as_canceled(now=time.time())
+
     def _only_traded(self, positions: dict[str, tuple[float, float]]) -> dict[str, tuple[float, float]]:
         """Scope account positions to tokens WE trade. Manual/UI positions in
         other markets are the operator's business — they must not enter our
@@ -400,12 +407,16 @@ class Engine:
         if base_p and base_p.type == "one_way" and self.cfg.one_way_adaptive.enabled:
             adaptive_result = self.adaptive.get_profile(cid, base_p)
             p = adaptive_result.profile
+            self._cur_vol_factor[cid] = adaptive_result.vol_factor
+            self._cur_vol_regime_factor[cid] = adaptive_result.vol_regime_factor
             # 如果模式刚切换了，estimators 里的 q_max 可能变了，重新初始化
             if adaptive_result.just_switched and cid in self.est:
                 self.est[cid] = self._make_estimators(p)
             self.profiles[cid] = p
         else:
             p = self.profiles[cid]
+            self._cur_vol_factor[cid] = 1.0
+            self._cur_vol_regime_factor[cid] = 1.0
 
         yes_book = self.md.book(meta.yes.token_id)
         no_book = self.md.book(meta.no.token_id)
@@ -509,6 +520,7 @@ class Engine:
             if ok:
                 for oid in plan.to_cancel:
                     self.state.remove_order(oid)
+                    self.state.mark_order_canceled(oid, ts=time.time())
             else:
                 # cancel MAY have partially applied server-side — keep our view,
                 # resync from REST, and skip placing this cycle (avoid doubles)
@@ -531,8 +543,39 @@ class Engine:
             else:
                 placed = await self.gateway.place(plan.to_place, meta)
                 placed_n = len(placed)
+                # 盘口参考价（YES 侧），用于算"我们的单离 touch 几跳"
+                _bb = yes_book.best_bid()
+                _ba = yes_book.best_ask()
+                _bb_p = _bb.price if _bb else None
+                _ba_p = _ba.price if _ba else None
                 for o in placed:
                     self.state.upsert_order(o)
+                    # 记录这笔单的决策环境快照
+                    if o.token_id == meta.yes.token_id:
+                        ref_price = _bb_p if o.side is Side.BUY else _ba_p
+                    else:
+                        # NO 侧：NO best_bid = 1 - YES best_ask
+                        ref_price = (1.0 - _ba_p) if o.side is Side.BUY else (1.0 - _bb_p)
+                    offset_ticks = None
+                    if ref_price is not None:
+                        offset_ticks = round((o.price - ref_price) / meta.tick_size, 2)
+                    self.state.record_order_context(
+                        o.order_id,
+                        cid=cid, token_id=o.token_id, side=o.side.value,
+                        price=o.price, size=o.size,
+                        regime=regime.value, fv=fv,
+                        vol_short=est.vol.short, vol_ratio=est.vol.ratio,
+                        toxicity=est.markout.toxicity, flow_z=est.flow.z,
+                        inventory_util=inv_util, risk_size_scale=rd.size_scale,
+                        yes_best_bid=_bb_p, yes_best_ask=_ba_p,
+                        our_offset_ticks=offset_ticks,
+                        pos_yes_size=pos_yes.size, pos_no_size=pos_no.size,
+                        strategy_type=p.type,
+                        base_size_usdc=p.base_size_usdc, q_max_usdc=p.q_max_usdc,
+                        vol_factor=self._cur_vol_factor.get(cid, 1.0),
+                        vol_regime_factor=self._cur_vol_regime_factor.get(cid, 1.0),
+                        placed_ts=now,
+                    )
                 soft = getattr(self.gateway, "soft_rejections", [])
                 if soft:
                     streak = self._soft_streak.get(cid, 0) + 1
@@ -573,6 +616,8 @@ class Engine:
             await self.gateway.cancel_asset(tok)
             for o in self.state.orders_for(tok):
                 self.state.remove_order(o.order_id)
+                # ★ 同步回填撤单时间，否则 order_context 里永远显示"挂着"
+                self.state.mark_order_canceled(o.order_id, ts=time.time())
         await self._refresh_token_orders(meta)
 
     async def _refresh_token_orders(self, meta: MarketMeta, grace_s: float = 0.0) -> None:

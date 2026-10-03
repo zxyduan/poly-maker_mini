@@ -32,6 +32,7 @@ class TradeEvent:
     trade_id: str
     status: TradeState
     ts: float
+    order_id: str | None = None   # 对应的 maker order_id（用于回填 order_context）
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,9 @@ class UserEventProcessor:
             self._applied[ev.trade_id] = fill
             self._on_fill(fill)
             self._on_change(condition_id)
+            # 回填订单上下文：这笔成交对应我们挂的哪笔单
+            if ev.order_id:
+                self._store.mark_order_filled(ev.order_id, price=ev.price, size=ev.size, ts=ev.ts)
 
         elif ev.status in (TradeState.CONFIRMED, TradeState.MINED):
             if ev.trade_id in self._applied and ev.status is TradeState.CONFIRMED:

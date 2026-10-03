@@ -449,6 +449,167 @@ def snapshots(
     store.close()
 
 
+@app.command(name="order-analyze")
+def order_analyze(
+    hours: int = typer.Option(24, help="最近多少小时的订单"),
+    limit: int = typer.Option(30, help="明细显示最近几笔"),
+    config_dir: str = typer.Option("config", help="config directory"),
+) -> None:
+    """分析买单/卖单合理性：成交率、分桶统计、最近明细。"""
+    import sqlite3
+    import time as _time
+
+    cfg = Config.load(config_dir)
+    conn = sqlite3.connect(cfg.paths.db)
+    conn.row_factory = sqlite3.Row
+    cutoff = _time.time() - hours * 3600
+
+    # 检查表是否存在
+    table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='order_context'"
+    ).fetchone()
+    if not table_exists:
+        console.print("[yellow]还没有 order_context 数据（表不存在）。先跑一会儿引擎再来看。[/yellow]")
+        raise typer.Exit()
+
+    # ── 总览 ──────────────────────────────────────────────────────────
+    total = conn.execute(
+        "SELECT COUNT(*) n FROM order_context WHERE placed_ts >= ?", (cutoff,)
+    ).fetchone()["n"]
+    if total == 0:
+        console.print(f"[yellow]最近 {hours} 小时没有订单记录。[/yellow]")
+        raise typer.Exit()
+
+    filled = conn.execute(
+        "SELECT COUNT(*) n FROM order_context WHERE placed_ts >= ? AND fill_ts IS NOT NULL",
+        (cutoff,),
+    ).fetchone()["n"]
+    canceled = conn.execute(
+        "SELECT COUNT(*) n FROM order_context WHERE placed_ts >= ? AND canceled_ts IS NOT NULL AND fill_ts IS NULL",
+        (cutoff,),
+    ).fetchone()["n"]
+
+    console.print(f"\n[bold]总览（最近 {hours}h）[/bold]")
+    console.print(f"  挂单总数: {total}  |  成交: {filled} ({filled/total*100:.1f}%)  |  撤单未成交: {canceled}  |  仍挂着: {total-filled-canceled}")
+
+    # ── 按 side 分组 ─────────────────────────────────────────────────
+    console.print("\n[bold]按方向分[/bold]")
+    t_side = Table(title="BUY vs SELL")
+    t_side.add_column("方向")
+    t_side.add_column("挂单数", justify="right")
+    t_side.add_column("成交数", justify="right")
+    t_side.add_column("成交率", justify="right")
+    t_side.add_column("平均挂单价", justify="right")
+    t_side.add_column("平均滑点", justify="right")
+    for side in ("BUY", "SELL"):
+        row = conn.execute(
+            """SELECT COUNT(*) n,
+                      SUM(CASE WHEN fill_ts IS NOT NULL THEN 1 ELSE 0 END) fn,
+                      AVG(price) avg_price,
+                      AVG(CASE WHEN fill_ts IS NOT NULL THEN ABS(fill_price - price) END) avg_slippage
+               FROM order_context WHERE placed_ts >= ? AND side=?""",
+            (cutoff, side),
+        ).fetchone()
+        if row["n"] == 0:
+            continue
+        rate = row["fn"] / row["n"] * 100
+        slip = f"{row['avg_slippage']:.4f}" if row["avg_slippage"] is not None else "-"
+        t_side.add_row(side, str(row["n"]), str(row["fn"]), f"{rate:.1f}%",
+                       f"{row['avg_price']:.4f}", slip)
+    console.print(t_side)
+
+    # ── 按 regime 分组 ────────────────────────────────────────────────
+    console.print("\n[bold]按市场状态分[/bold]")
+    t_reg = Table(title="不同 Regime 下的成交率")
+    t_reg.add_column("Regime")
+    t_reg.add_column("挂单数", justify="right")
+    t_reg.add_column("成交数", justify="right")
+    t_reg.add_column("成交率", justify="right")
+    t_reg.add_column("平均 offset(跳)", justify="right")
+    rows = conn.execute(
+        """SELECT regime, COUNT(*) n,
+                  SUM(CASE WHEN fill_ts IS NOT NULL THEN 1 ELSE 0 END) fn,
+                  AVG(our_offset_ticks) avg_off
+           FROM order_context WHERE placed_ts >= ?
+           GROUP BY regime ORDER BY n DESC""",
+        (cutoff,),
+    ).fetchall()
+    for r in rows:
+        rate = r["fn"] / r["n"] * 100
+        off = f"{r['avg_off']:.1f}" if r["avg_off"] is not None else "-"
+        t_reg.add_row(r["regime"], str(r["n"]), str(r["fn"]), f"{rate:.1f}%", off)
+    console.print(t_reg)
+
+    # ── 按 offset_ticks 分桶（买单）───────────────────────────────────
+    console.print("\n[bold]按挂单位置分（买单：压价越深成交越难？）[/bold]")
+    t_off = Table(title="BUY 单 offset 分布 vs 成交率")
+    t_off.add_column("offset 区间(跳)")
+    t_off.add_column("挂单数", justify="right")
+    t_off.add_column("成交数", justify="right")
+    t_off.add_column("成交率", justify="right")
+    rows = conn.execute(
+        """SELECT
+                  CASE
+                    WHEN our_offset_ticks IS NULL THEN 'unknown'
+                    WHEN our_offset_ticks >= -0.5 THEN '0 (贴touch)'
+                    WHEN our_offset_ticks >= -2.5 THEN '-1~-2 (压1-2跳)'
+                    WHEN our_offset_ticks >= -5.5 THEN '-3~-5 (压3-5跳)'
+                    ELSE '<=-6 (深压)'
+                  END bucket,
+                  COUNT(*) n,
+                  SUM(CASE WHEN fill_ts IS NOT NULL THEN 1 ELSE 0 END) fn
+           FROM order_context WHERE placed_ts >= ? AND side='BUY'
+           GROUP BY bucket ORDER BY MIN(our_offset_ticks)""",
+        (cutoff,),
+    ).fetchall()
+    for r in rows:
+        rate = r["fn"] / r["n"] * 100
+        t_off.add_row(r["bucket"], str(r["n"]), str(r["fn"]), f"{rate:.1f}%")
+    console.print(t_off)
+
+    # ── 最近明细 ──────────────────────────────────────────────────────
+    console.print(f"\n[bold]最近 {limit} 笔订单明细[/bold]")
+    t_det = Table(title="")
+    t_det.add_column("时间")
+    t_det.add_column("方向")
+    t_det.add_column("价格", justify="right")
+    t_det.add_column("数量", justify="right")
+    t_det.add_column("Regime")
+    t_det.add_column("offset", justify="right")
+    t_det.add_column("FV", justify="right")
+    t_det.add_column("tox", justify="right")
+    t_det.add_column("状态", justify="center")
+    t_det.add_column("存活(s)", justify="right")
+    rows = conn.execute(
+        """SELECT placed_ts, side, price, size, regime, our_offset_ticks, fv, toxicity,
+                  fill_ts, canceled_ts
+           FROM order_context WHERE placed_ts >= ?
+           ORDER BY placed_ts DESC LIMIT ?""",
+        (cutoff, limit),
+    ).fetchall()
+    from datetime import datetime as _dt
+    for r in rows:
+        t = _dt.fromtimestamp(r["placed_ts"]).strftime("%m-%d %H:%M:%S")
+        if r["fill_ts"]:
+            status = "[green]✓成交[/green]"
+            alive = int(r["fill_ts"] - r["placed_ts"])
+        elif r["canceled_ts"]:
+            status = "[yellow]撤单[/yellow]"
+            alive = int(r["canceled_ts"] - r["placed_ts"])
+        else:
+            status = "[blue]挂着[/blue]"
+            alive = int(_time.time() - r["placed_ts"])
+        tox = f"{r['toxicity']:.2f}" if r["toxicity"] is not None else "-"
+        off = f"{r['our_offset_ticks']:.0f}" if r["our_offset_ticks"] is not None else "?"
+        t_det.add_row(
+            t, r["side"], f"{r['price']:.4f}", f"{r['size']:.1f}",
+            r["regime"], off, f"{r['fv']:.4f}", tox, status, str(alive),
+        )
+    console.print(t_det)
+
+    conn.close()
+
+
 if __name__ == "__main__":
     app()
 #（注：内容由AI生成）

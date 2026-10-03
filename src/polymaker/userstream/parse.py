@@ -80,6 +80,7 @@ def normalize_trade(
                 trade_id=f"{trade_id}:{i}" if len(msg.get('maker_orders', [])) > 1 else trade_id,
                 status=status,
                 ts=ts,
+                order_id=str(mo.get("order_id") or mo.get("id") or "") or None,
             )
         )
     return out
