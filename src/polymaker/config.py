@@ -196,6 +196,27 @@ class OneWayProfile(StrategyProfile):
 AnyProfile = StrategyProfile | OneWayProfile
 
 
+class AdaptiveConfig(BaseModel):
+    """One-way 动态参数配置。"""
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    recalc_interval_s: int = 7200          # 2 小时重算一次系数
+    hysteresis_pct: float = 0.2           # 滞回缓冲区 20%
+    # 数据不足时的保守系数
+    conservative_vol_factor: float = 0.3
+    conservative_vol_regime_factor: float = 1.5
+    # 过渡模式（数据不足 min_buckets_normal 时）
+    transition_vol_factor: float = 0.5
+    transition_vol_regime_factor: float = 1.2
+    # 新市场策略：True = 完全不挂买单，False = 保守参数试水
+    new_market_no_order: bool = False
+    # 最少几个桶才算正常模式
+    min_buckets_normal: int = 6
+    # 系数阈值（可以调）
+    vol_thresholds: tuple[float, float, float] = (5.0, 20.0, 100.0)
+
+
 # Keys allowed on a market entry that are NOT profile overrides.
 _MARKET_RESERVED = {"slug", "condition_id", "profile", "enabled"}
 
@@ -263,6 +284,7 @@ class Config(BaseModel):
     scan: ScanSettings = ScanSettings()
     profiles: dict[str, StrategyProfile] = {}
     markets: list[MarketEntry] = []
+    one_way_adaptive: AdaptiveConfig = AdaptiveConfig()
     secrets: Secrets = Field(default_factory=Secrets)
     config_dir: Path = Path("config")
 
@@ -301,6 +323,9 @@ class Config(BaseModel):
         }
         markets = [MarketEntry(**m) for m in (mkts.get("markets") or [])]
 
+        # 动态参数配置（可选，用默认值）
+        adaptive = AdaptiveConfig(**(strat.get("one_way_adaptive") or {}))
+
         return cls(
             wallet=WalletConfig(**main.get("wallet", {})),
             engine=EngineConfig(**main.get("engine", {})),
@@ -310,6 +335,7 @@ class Config(BaseModel):
             scan=ScanSettings(**main.get("scan", {})),
             profiles=profiles,
             markets=markets,
+            one_way_adaptive=adaptive,
             secrets=Secrets(),
             config_dir=cdir,
         )

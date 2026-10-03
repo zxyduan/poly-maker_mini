@@ -380,6 +380,7 @@ def snapshot_collector(
         store.close()
         console.print("\n[yellow]快照采集器已停止。[/yellow]")
 
+    from datetime import datetime
     console.print(f"[bold green]启动 snapshot-collector[/bold green] 间隔={interval}s")
     try:
         asyncio.run(_loop())

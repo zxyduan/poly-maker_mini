@@ -17,9 +17,11 @@ from datetime import datetime
 from typing import Any
 
 from polymaker.alerts import Alerter
+from polymaker.catalog.adaptive import AdaptiveEngine
 from polymaker.catalog.gamma import GammaClient, fetch_reward_rates, parse_market
+from polymaker.catalog.snapshots import SnapshotStore
 from polymaker.catalog.store import CatalogStore
-from polymaker.config import Config, StrategyProfile
+from polymaker.config import Config, OneWayProfile, StrategyProfile
 from polymaker.domain import Fill, MarketMeta, Regime, Side
 from polymaker.execution.gateway import ExecutionGateway
 from polymaker.execution.reconciler import reconcile
@@ -69,8 +71,24 @@ class Engine:
 
         # per-market state
         self.metas: dict[str, MarketMeta] = {}
-        self.profiles: dict[str, StrategyProfile] = {}
+        self.profiles: dict[str, StrategyProfile] = {}  # 当前生效的 profile（含动态调整）
+        self.base_profiles: dict[str, StrategyProfile] = {}  # 基础 profile（未调整）
         self.strategy_fn: dict[str, StrategyFn] = {}
+
+        # 动态参数引擎（只对 one_way 策略生效）
+        self.snapshot_store = SnapshotStore(cfg.paths.db)
+        self.adaptive = AdaptiveEngine(
+            self.snapshot_store,
+            hysteresis_pct=cfg.one_way_adaptive.hysteresis_pct,
+            recalc_interval_s=cfg.one_way_adaptive.recalc_interval_s,
+            conservative_vol_factor=cfg.one_way_adaptive.conservative_vol_factor,
+            conservative_vol_regime_factor=cfg.one_way_adaptive.conservative_vol_regime_factor,
+            transition_vol_factor=cfg.one_way_adaptive.transition_vol_factor,
+            transition_vol_regime_factor=cfg.one_way_adaptive.transition_vol_regime_factor,
+            new_market_no_order=cfg.one_way_adaptive.new_market_no_order,
+            min_buckets_normal=cfg.one_way_adaptive.min_buckets_normal,
+            vol_thresholds=cfg.one_way_adaptive.vol_thresholds,
+        )
         self.est: dict[str, MarketEstimators] = {}
         self.regime_m: dict[str, RegimeMachine] = {}
         self._dirty: dict[str, asyncio.Event] = {}
@@ -192,7 +210,8 @@ class Engine:
                     continue
                 self.metas[meta.condition_id] = meta
                 p = self.cfg.profile_for(entry)
-                self.profiles[meta.condition_id] = p
+                self.base_profiles[meta.condition_id] = p  # 存基础 profile
+                self.profiles[meta.condition_id] = p       # 初始先用基础的，后面热路径里动态调整
                 # resolve the quoter once by profile type (no hot-path branching)
                 self.strategy_fn[meta.condition_id] = get_strategy(p.type)
                 self.est[meta.condition_id] = self._make_estimators(p)
@@ -375,7 +394,19 @@ class Engine:
 
     async def _recompute_locked(self, cid: str) -> None:
         meta = self.metas[cid]
-        p = self.profiles[cid]
+
+        # 动态参数调整：只对 one_way 策略生效
+        base_p = self.base_profiles.get(cid)
+        if base_p and base_p.type == "one_way" and self.cfg.one_way_adaptive.enabled:
+            adaptive_result = self.adaptive.get_profile(cid, base_p)
+            p = adaptive_result.profile
+            # 如果模式刚切换了，estimators 里的 q_max 可能变了，重新初始化
+            if adaptive_result.just_switched and cid in self.est:
+                self.est[cid] = self._make_estimators(p)
+            self.profiles[cid] = p
+        else:
+            p = self.profiles[cid]
+
         yes_book = self.md.book(meta.yes.token_id)
         no_book = self.md.book(meta.no.token_id)
         if yes_book is None or yes_book.is_empty:
