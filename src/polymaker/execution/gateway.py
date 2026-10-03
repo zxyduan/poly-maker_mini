@@ -201,8 +201,19 @@ class ExecutionGateway:
             ]
             resp = await self._client.post_orders(signed)
             return self._parse_place_response(resp, quotes)
-        except Exception as exc:  # noqa: BLE001 - surface + continue; engine handles error rate
-            log.error("place_failed", err=str(exc), n=len(quotes))
+        except Exception as exc:  # noqa: BLE001
+            if self._is_transient_place_error(exc):
+                # 429 限流 / 425 引擎重启 / 503 cancel-only|post-only / 网络抖动 —
+                # 这些是交易所层面的瞬时状态，不是订单本身的问题。填入
+                # soft_rejections 让 engine 走软恢复（resync + 下 tick 重试），
+                # 连续 5 次仍失败才升级 quarantine。
+                log.warning("place_transient", err=str(exc)[:200], n=len(quotes),
+                            status=getattr(exc, "status", None),
+                            restriction=getattr(exc, "restriction", None),
+                            retry_after=getattr(exc, "retry_after", None))
+                self.soft_rejections.append(f"transient:{type(exc).__name__}")
+            else:
+                log.error("place_failed", err=str(exc), n=len(quotes))
             return []
 
     def _paper_order(self, q: Quote) -> OpenOrder:
@@ -232,7 +243,7 @@ class ExecutionGateway:
                 ok = getattr(item, "ok", True)
                 err = "" if ok else str(getattr(item, "message", "") or getattr(item, "code", ""))
             if err and err not in ("", "None"):
-                soft = self._is_state_lag_rejection(err)
+                soft = self._is_state_lag_rejection(err, q.side)
                 log.warning("order_rejected_soft" if soft else "order_rejected",
                             err=err[:200], side=q.side.value,
                             price=q.price, size=q.size)
@@ -246,11 +257,88 @@ class ExecutionGateway:
         return out
 
     @staticmethod
-    def _is_state_lag_rejection(err: str) -> bool:
-        """'sum of matched orders: N>0' = 自己挂单锁了额度，不是真没钱。"""
+    def _is_state_lag_rejection(err: str, side: Side) -> bool:
+        """识别状态延迟类的软错误（需要 resync，不应 quarantine）。
+
+        软错误 = 引擎本地状态与链上/交易所实际状态短暂不一致，自动 resync 即可恢复；
+        硬错误 = 请求本身有问题（余额真不足、参数非法），resync 无用，需人工介入。
+
+        Args:
+            err: CLOB 返回的错误消息文本。
+            side: 被拒订单的方向（BUY / SELL）。
+
+        Returns:
+            True = 软错误，调用方应 resync 挂单与持仓；False = 硬错误。
+        """
+        err_lower = err.lower()
+
+        # 规则 1：自己挂单锁了额度（原来就有的规则）。
         m = re.search(r"sum of matched orders:\s*(\d+)", err, re.IGNORECASE)
-        return m is not None and int(m.group(1)) > 0
-    
+        if m and int(m.group(1)) > 0:
+            return True
+
+        # 规则 2：卖单报余额/授权不足 → 大概率是持仓数据不同步
+        # （卖单成交了但 WS 推送还没到，本地还记着旧持仓）。买单报余额不足
+        # 是真没钱买，属于硬错误。
+        if "not enough balance" in err_lower and side is Side.SELL:
+            return True
+
+        # 规则 3：post-only 订单跨越订单簿（会立即成交），不是真错误——
+        # 价格需要往回挪一档，resync 后重挂即可。
+        # 官方有两种写法："order {id} crosses the book" 和
+        # "invalid post-only order: order crosses book"。
+        if "crosses the book" in err_lower or "crosses book" in err_lower:
+            return True
+
+        # 规则 4：重复订单（同一笔已经挂过了），说明本地状态落后于交易所，
+        # resync 挂单列表即可。
+        if "duplicated" in err_lower:
+            return True
+
+        # 规则 5：订单已在 CTF 合约链上被取消（可能由另一进程或 admin 操作），
+        # 本地还以为它挂着——resync 挂单列表即可，不是真错误。
+        if "canceled in the ctf exchange contract" in err_lower:
+            return True
+
+        # 规则 6：撮合引擎因市场行情暂时无法处理订单（瞬时条件），下一 tick 重试即可。
+        if "match delayed due to market conditions" in err_lower:
+            return True
+
+        # 规则 7：市场还没准备好接受新订单（开盘预热），等一下再试。
+        if "not yet ready to process new orders" in err_lower:
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_transient_place_error(exc: Exception) -> bool:
+        """判断 place() 抛出的异常是否属于交易所层面的瞬时状态。
+
+        这些错误不是订单本身有问题（余额不足、参数非法），而是：
+        - 429 限流 → 退避后重试
+        - 425 撮合引擎重启中 → 退避后重试
+        - 503 cancel-only / post-only 模式 → 等引擎恢复
+        - 500 服务端内部错误 → 官方建议退避重试
+        - 网络层抖动 (TransportError) → 重试
+        """
+        # 延迟导入：polymarket SDK 只在 live 模式下连接，paper/CLI 不需要。
+        from polymarket.errors import (
+            RateLimitError,
+            RequestRejectedError,
+            TransportError,
+        )
+
+        if isinstance(exc, (RateLimitError, TransportError)):
+            return True
+        if isinstance(exc, RequestRejectedError):
+            # 425 restarting / 503 cancel_only / post_only — SDK 已解析为 restriction
+            if getattr(exc, "restriction", None) is not None:
+                return True
+            # 500 服务端错误 — 官方文档明确建议退避重试
+            if getattr(exc, "status", 0) == 500:
+                return True
+        return False
+
     # ── cancellation ────────────────────────────────────────────────────
     async def cancel(self, order_ids: list[str]) -> bool:
         """Cancel by id. Returns True on success — callers must NOT drop the

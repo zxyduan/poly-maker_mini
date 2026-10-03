@@ -543,8 +543,10 @@ class Engine:
                         self.risk.note_order_result(False)
                         await self._quarantine(meta, reason="soft_rejection_stuck")
                     else:
-                        # state 延迟：resync 挂单，下一 tick 再算
-                        log.warning("soft_rejection_resync", cid=cid[:8],
+                        # state 延迟：先主动拉取最新持仓修正本地库存，再 resync 挂单。
+                        # 不 quarantine，下一 tick 基于正确的持仓重新报价。
+                        await self._sync_positions_for_market(cid, meta)
+                        log.warning("soft_rejection_recovered", cid=cid[:8],
                                     n=len(soft), streak=streak)
                         self.risk.note_order_result(True)
                         await self._refresh_token_orders(meta, grace_s=10.0)
@@ -580,6 +582,32 @@ class Engine:
             self.state.replace_open_orders(
                 tok, [o for o in live if o.token_id == tok], grace_s=grace_s
             )
+
+    async def _sync_positions_for_market(self, cid: str, meta: MarketMeta) -> None:
+        """主动从 Data API 拉取最新持仓，修正本市场的本地库存。
+
+        遇到软错误（如卖单报 not-enough-balance）时调用，解决"引擎以为还有
+        持仓可卖、实际已经被成交卖光了但 WS 推送还没到"的状态滞后问题。
+        失败不阻塞主流程——只是记一条 warning，下一轮 reconcile 会兜底。
+        """
+        try:
+            all_positions = await self.gateway.positions()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("positions_sync_failed", cid=cid[:8], err=str(exc))
+            return
+        market_tokens = {meta.yes.token_id, meta.no.token_id}
+        market_positions = {
+            t: v for t, v in all_positions.items() if t in market_tokens
+        }
+        if market_positions:
+            self.state.reconcile_positions(market_positions)
+        log.info(
+            "positions_synced",
+            cid=cid[:8],
+            tokens=len(market_positions),
+            yes=market_positions.get(meta.yes.token_id, (0.0, 0.0))[0],
+            no=market_positions.get(meta.no.token_id, (0.0, 0.0))[0],
+        )
 
     def _maybe_merge(self, cid: str, meta: MarketMeta, p: StrategyProfile,
                      yes_size: float, no_size: float) -> None:
