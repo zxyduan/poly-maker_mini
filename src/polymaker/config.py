@@ -178,11 +178,12 @@ class OneWayProfile(StrategyProfile):
     # ── 合理价值（Fair Value）配置 ──
     # 初始合理价值（比如 0.05 = 5¢）
     fv_initial: float = 0.05
-    # 到期日期（ISO 格式，比如 "2026-12-31"）
+    # 起始日期（ISO 格式，比如 "2026-01-01"）：fv_initial 是这一天的合理价值
+    fv_start_date: str = ""
+    # 到期日期（ISO 格式，比如 "2026-12-31"）：合理价值按天线性衰减，到期归零
     fv_end_date: str = ""
-    # 合理价值按天线性衰减，到期归零
-    # 比如 fv_initial=0.05，fv_end_date="2026-12-31"
-    # 那每天衰减 0.05 / (从今天到到期的天数)
+    # 衰减公式：fv_now = fv_initial * (fv_end_date - now) / (fv_end_date - fv_start_date)
+    # fv_start_date 留空则不衰减（fv_now 永远 = fv_initial）
 
     # ── 分层挂单配置 ──
     # 买几层（第 2、3、4 层都在合理价值以下）

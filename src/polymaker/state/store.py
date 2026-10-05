@@ -78,6 +78,14 @@ CREATE TABLE IF NOT EXISTS order_context (
     vol_factor       REAL,                  -- adaptive 系数
     vol_regime_factor REAL,
 
+    -- v3 one_way 新增决策快照（O-1/O-2）
+    our_fv           REAL,                  -- calc_fair_value(p) 算出的锚定价值
+    scenario         TEXT,                 -- calm / up_trend / down_trend
+    trend_streak     INTEGER,               -- 采集器连续同向桶数
+    vol_gap_ticks    REAL,                 -- 本次实际用的层间距（1/3/5）
+    pos_yes_avg      REAL,                 -- 挂单时 YES 持仓均价
+    pos_no_avg       REAL,                 -- 挂单时 NO 持仓均价
+
     placed_ts        REAL NOT NULL,
 
     -- 结果（后续回填）
@@ -100,6 +108,7 @@ class StateStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        self._migrate_order_context()
         self._conn.commit()
 
         self.positions: dict[str, Position] = {}
@@ -289,6 +298,26 @@ class StateStore:
                     prev=round(prev.size, 2) if prev else 0.0, now=round(size, 2))
 
     # ── order context snapshots ───────────────────────────────────────
+    def _migrate_order_context(self) -> None:
+        """旧库加列兜底：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列。"""
+        existing = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(order_context)")
+        }
+        add_cols = {
+            "our_fv": "REAL",
+            "scenario": "TEXT",
+            "trend_streak": "INTEGER",
+            "vol_gap_ticks": "REAL",
+            "pos_yes_avg": "REAL",
+            "pos_no_avg": "REAL",
+        }
+        for col, typ in add_cols.items():
+            if col not in existing:
+                with contextlib.suppress(sqlite3.Error):
+                    self._conn.execute(
+                        f"ALTER TABLE order_context ADD COLUMN {col} {typ}"
+                    )
+
     def record_order_context(self, oid: str, *, cid: str, token_id: str, side: str,
                              price: float, size: float, regime: str, fv: float,
                              vol_short: float | None, vol_ratio: float | None,
@@ -300,7 +329,13 @@ class StateStore:
                              strategy_type: str | None, base_size_usdc: float | None,
                              q_max_usdc: float | None,
                              vol_factor: float | None, vol_regime_factor: float | None,
-                             placed_ts: float) -> None:
+                             placed_ts: float,
+                             our_fv: float | None = None,
+                             scenario: str | None = None,
+                             trend_streak: int | None = None,
+                             vol_gap_ticks: float | None = None,
+                             pos_yes_avg: float | None = None,
+                             pos_no_avg: float | None = None) -> None:
         """记录一笔下单时的完整决策环境快照。幂等：同一 order_id 不重复插。"""
         self._conn.execute(
             """INSERT OR IGNORE INTO order_context(
@@ -310,15 +345,19 @@ class StateStore:
                 yes_best_bid, yes_best_ask, our_offset_ticks,
                 pos_yes_size, pos_no_size,
                 strategy_type, base_size_usdc, q_max_usdc,
-                vol_factor, vol_regime_factor, placed_ts
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                vol_factor, vol_regime_factor, placed_ts,
+                our_fv, scenario, trend_streak, vol_gap_ticks,
+                pos_yes_avg, pos_no_avg
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (oid, cid, token_id, side, price, size,
              regime, fv, vol_short, vol_ratio, toxicity, flow_z,
              inventory_util, risk_size_scale,
              yes_best_bid, yes_best_ask, our_offset_ticks,
              pos_yes_size, pos_no_size,
              strategy_type, base_size_usdc, q_max_usdc,
-             vol_factor, vol_regime_factor, placed_ts),
+             vol_factor, vol_regime_factor, placed_ts,
+             our_fv, scenario, trend_streak, vol_gap_ticks,
+             pos_yes_avg, pos_no_avg),
         )
         self._conn.commit()
 

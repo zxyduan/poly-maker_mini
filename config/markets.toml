@@ -1,5 +1,18 @@
 # Trade list (supervised MM session).
+#
+# 每个市场单独配合理价值（fv_*），这些字段是 OneWayProfile 的 override，
+# 会合并到 profile 上（见 config.py: with_overrides）。
+#
+# fv_initial:    该市场在 fv_start_date 当天的合理价值（比如 0.03 = 3¢）
+# fv_start_date: 衰减起点（ISO 日期），留空 "" 表示不衰减
+# fv_end_date:  到期日（ISO 日期），fv 线性衰减到 0
+#
+# 衰减公式：fv_now = fv_initial × (fv_end_date - now) / (fv_end_date - fv_start_date)
+
 [[markets]]
-slug    = "clarity-act-signed-into-law-in-2026"
-profile = "one_way"
-enabled = true
+slug          = "clarity-act-signed-into-law-in-2026"
+profile       = "one_way"
+enabled       = true
+fv_initial    = 0.05
+fv_start_date = ""
+fv_end_date   = ""

@@ -35,6 +35,7 @@ from polymaker.state.store import StateStore
 from polymaker.state.tracker import UserEventProcessor
 from polymaker.strategy import StrategyFn, get_strategy
 from polymaker.strategy.base import StrategyInputs
+from polymaker.strategy.one_way import calc_fair_value, _get_market_scenario
 from polymaker.strategy.estimators import (
     FlowEstimator,
     MarketEstimators,
@@ -506,6 +507,21 @@ class Engine:
         snap = self.snapshot_store.last_snapshot(cid)
         trend_streak = snap.trend_streak if snap else 0
 
+        # v3 one_way 决策快照（O-1/O-2）：只对 one_way 策略有意义
+        our_fv: float | None = None
+        scenario: str | None = None
+        vol_gap_ticks: float | None = None
+        if isinstance(p, OneWayProfile):
+            our_fv = calc_fair_value(p)
+            scenario = _get_market_scenario(trend_streak)
+            vol = est.vol.short or 0.0
+            if vol > 0.05:
+                vol_gap_ticks = 5
+            elif vol > 0.02:
+                vol_gap_ticks = 3
+            else:
+                vol_gap_ticks = 1
+
         # 读我们自己的挂单价格列表
         our_bids = tuple(o.price for o in self.state.orders_for(meta.yes.token_id) if o.side == Side.BUY)
         our_asks = tuple(o.price for o in self.state.orders_for(meta.yes.token_id) if o.side == Side.SELL)
@@ -587,6 +603,12 @@ class Engine:
                         vol_factor=self._cur_vol_factor.get(cid, 1.0),
                         vol_regime_factor=self._cur_vol_regime_factor.get(cid, 1.0),
                         placed_ts=now,
+                        our_fv=our_fv,
+                        scenario=scenario,
+                        trend_streak=trend_streak,
+                        vol_gap_ticks=vol_gap_ticks,
+                        pos_yes_avg=pos_yes.avg_price,
+                        pos_no_avg=pos_no.avg_price,
                     )
                 soft = getattr(self.gateway, "soft_rejections", [])
                 if soft:

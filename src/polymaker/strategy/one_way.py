@@ -29,16 +29,16 @@ _EPS = 1e-9
 def calc_fair_value(p: OneWayProfile) -> float:
     """计算今天的合理价值（按天线性衰减，到期归零）。
 
-    假设：
-    - fv_initial 是今天的合理价值
-    - fv_end_date 是到期日期
-    - 从今天到到期日，合理价值线性衰减到 0
+    衰减逻辑：
+    - 配了 fv_start_date：从 fv_start_date 到 fv_end_date 线性衰减。
+      起始日 fv = fv_initial，到期日 fv = 0。
+    - 没配 fv_start_date：不衰减，直接返回 fv_initial（向后兼容）。
 
     Args:
         p: OneWayProfile 配置
 
     Returns:
-        今天的合理价值，如果没有配置到期日期，返回 fv_initial
+        今天的合理价值
     """
     if not p.fv_end_date:
         return p.fv_initial
@@ -51,10 +51,20 @@ def calc_fair_value(p: OneWayProfile) -> float:
         if days_left <= 0:
             return 0.0  # 到期了，合理价值归零
 
-        # 简化：fv_initial 就是今天的合理价值
-        # 我们不衰减过去，只从现在开始衰减
-        # 这样配置的 fv_initial 就是当前的合理价值
-        return p.fv_initial
+        # 没配起始日期：不衰减
+        if not p.fv_start_date:
+            return p.fv_initial
+
+        start_date = datetime.fromisoformat(p.fv_start_date).replace(tzinfo=timezone.utc)
+        total_days = (end_date - start_date).total_seconds() / 86400.0
+        if total_days <= 0:
+            return p.fv_initial
+
+        if now < start_date:
+            return p.fv_initial  # 还没开始衰减
+
+        # 线性衰减：fv_now = fv_initial * days_left / total_days
+        return p.fv_initial * max(0.0, days_left) / total_days
     except (ValueError, TypeError):
         return p.fv_initial
 
@@ -281,24 +291,28 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
         price_above_fv = (best_ask is not None and best_ask > fv)
 
         # 决定挂几层卖单
-        if near_end or panic:
-            # 接近到期或恐慌：加速卖
+        if panic:
+            # 恐慌不卖（用户要求）：toxicity 高时观望，不挂卖单
+            sell_layer_count = 0
+        elif near_end:
+            # 接近到期：加速卖，挂全部层
             sell_layer_count = effective_sell_layers
         elif cost_above_fv and not price_above_fv:
-            # 买贵了 + 价格在合理价值下方：只挂 1 层，加速跑
+            # 买贵了 + 价格在合理价值下方：只挂 1 层在盘口，加速跑
             sell_layer_count = 1
         elif not cost_above_fv and not price_above_fv:
-            # 买便宜了 + 价格在合理价值下方：只挂 1 层，慢慢卖
-            sell_layer_count = 1
+            # 买便宜了 + 价格在合理价值下方：挂多层
+            # 第 1 层轻仓挂在盘口 best_ask，其他层参考合理价值往上挂
+            sell_layer_count = effective_sell_layers
         else:
-            # 正常情况：挂全部 effective_sell_layers 层
+            # 正常情况（价格在合理价值上方）：挂全部层
             sell_layer_count = effective_sell_layers
 
         # 挂卖单
         # 先计算第一层卖单价格
-        # 1. 先比较 inp.fv 和 our_fv * 0.9，谁小取谁
+        # 1. 先比较 inp.fv 和 our_fv * 0.8，谁小取谁（D-1: 0.9 -> 0.8，对齐设计文档 13.2）
         # 2. 再和盘口 best_ask 比较，谁大取谁
-        first_sell_candidate = min(inp.fv, fv * 0.9)
+        first_sell_candidate = min(inp.fv, fv * 0.8)
         if best_ask is not None:
             first_sell_price = max(first_sell_candidate, best_ask)
         else:
@@ -313,10 +327,12 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
         else:  # 低波动
             sell_vol_gap = 1
 
+        prev_price = 0.0
         for i in range(sell_layer_count):
             layer_num = i + 1
-            if sell_layer_count == 1 and not price_above_fv:
-                # 价格在合理价值下方：挂在最新卖单位置附近
+            if not price_above_fv and layer_num == 1:
+                # 价格在合理价值下方：第 1 层挂在最新卖单位置（盘口）
+                # 无论 sell_layer_count 是 1 还是多层，第 1 层都走这里
                 if best_ask is not None:
                     price = best_ask
                 else:
@@ -325,8 +341,14 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
                 if layer_num == 1:
                     price = first_sell_price
                 else:
-                    # 其他层：在第一层的基础上，往上排，每层间隔 sell_vol_gap tick
-                    price = first_sell_price + (layer_num - 1) * sell_vol_gap * tick
+                    # D-2：第 2/3/4 层从 our_fv 起算（对齐设计文档 13.2），
+                    # 而不是从第 1 层往上叠。
+                    price = fv + (layer_num - 1) * sell_vol_gap * tick
+                    # 保护：卖单必须严格高于上一层。
+                    # 当 best_ask 把第 1 层抬高到 our_fv 之上时，按 our_fv 起算的
+                    # 第 2 层可能 <= 第 1 层，会倒挂（卖得比自己第 1 层还便宜）。
+                    if price <= prev_price:
+                        price = prev_price + sell_vol_gap * tick
 
             # 确保价格小于 1
             if price >= 1.0:

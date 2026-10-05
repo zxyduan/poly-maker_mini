@@ -94,13 +94,21 @@ merge_min_size      = 20.0
 type = "one_way"
 
 # ── 合理价值配置（v3 新增）──
-# fv_initial: 初始合理价值（比如 0.05 = 5¢）
-#   策略围绕这个合理价值挂单，不是围绕盘口
+# 注意：fv_initial / fv_start_date / fv_end_date 是【每个市场独有】的，
+#       不要在 profile 里硬编码日期。下面的 fv_initial=0.05 只是 fallback 默认值，
+#       真正的合理价值在 markets.toml 每个 [[markets]] 条目里单独配，例如：
+#
+#       [[markets]]
+#       slug = "putin-out-before-2027-346"
+#       profile = "one_way"
+#       enabled = true
+#       fv_initial = 0.03
+#       fv_start_date = "2026-01-01"
+#       fv_end_date = "2027-03-31"
+#
+# 衰减公式：fv_now = fv_initial × (fv_end_date - now) / (fv_end_date - fv_start_date)
+# fv_start_date 留空则不衰减（fv_now 永远 = fv_initial）
 fv_initial = 0.05
-
-# fv_end_date: 到期日期（ISO 格式，比如 "2026-12-31"）
-#   合理价值按天线性衰减，到期归零
-fv_end_date = "2026-12-31"
 
 # buy_layers: 买几层（都在合理价值以下）
 buy_layers = 4
