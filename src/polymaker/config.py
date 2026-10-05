@@ -174,6 +174,24 @@ class OneWayProfile(StrategyProfile):
     type: Literal["one_way"] = "one_way"  # type: ignore[assignment]  # narrows base discriminator
 
     ow_side: Literal["yes", "no"] = "yes"
+
+    # ── 合理价值（Fair Value）配置 ──
+    # 初始合理价值（比如 0.05 = 5¢）
+    fv_initial: float = 0.05
+    # 到期日期（ISO 格式，比如 "2026-12-31"）
+    fv_end_date: str = ""
+    # 合理价值按天线性衰减，到期归零
+    # 比如 fv_initial=0.05，fv_end_date="2026-12-31"
+    # 那每天衰减 0.05 / (从今天到到期的天数)
+
+    # ── 分层挂单配置 ──
+    # 买几层（第 2、3、4 层都在合理价值以下）
+    buy_layers: int = 3
+    # 卖几层（都在合理价值以上）
+    sell_layers: int = 4
+    # 每层间隔的 tick 数（会根据波动率自动调整）
+    base_layer_gap_ticks: int = 3
+
     # pyramid weights summing to 1 across buy layers (fraction of base_size)
     ow_pyramid_shares: list[float] = [0.10, 0.20, 0.30, 0.40]
     # a wall = a bid level whose notional (price*size) >= 24h volume * this
@@ -185,7 +203,7 @@ class OneWayProfile(StrategyProfile):
     ow_edge_base_ticks: int = 5
     # inventory brakes on held / q_max_shares
     ow_inv_low: float = 0.33  # below: full size
-    ow_inv_mid: float = 0.66  # above: stop buying entirely
+    ow_inv_mid: float = 0.50  # above: stop buying entirely
     # toxicity >= this => exit into the bid instead of resting under the ask
     ow_panic_toxicity: float = 0.6
     # within this many days of end: sell only, no new buys

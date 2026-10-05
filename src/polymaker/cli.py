@@ -337,7 +337,16 @@ def snapshot_collector(
                         continue
                     condition_id, yes_token_id = ids
 
-                await collector.collect(condition_id, yes_token_id)
+                # 从市场配置里读 fv_initial 和 fv_end_date
+                fv_initial = m.overrides.get("fv_initial", 0.0)
+                fv_end_date = m.overrides.get("fv_end_date", "")
+
+                await collector.collect(
+                    condition_id,
+                    yes_token_id,
+                    fv_initial=fv_initial,
+                    fv_end_date=fv_end_date,
+                )
 
                 # 打印简洁日志
                 rows = store.history(condition_id, limit=1)

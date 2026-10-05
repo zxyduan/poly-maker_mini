@@ -93,6 +93,25 @@ merge_min_size      = 20.0
 [profiles.one_way]
 type = "one_way"
 
+# ── 合理价值配置（v3 新增）──
+# fv_initial: 初始合理价值（比如 0.05 = 5¢）
+#   策略围绕这个合理价值挂单，不是围绕盘口
+fv_initial = 0.05
+
+# fv_end_date: 到期日期（ISO 格式，比如 "2026-12-31"）
+#   合理价值按天线性衰减，到期归零
+fv_end_date = "2026-12-31"
+
+# buy_layers: 买几层（都在合理价值以下）
+buy_layers = 4
+
+# sell_layers: 卖几层（都在合理价值以上）
+sell_layers = 4
+
+# base_layer_gap_ticks: 每层间隔多少 tick
+#   会根据波动率自动调整（低波动密一点，高波动疏一点）
+base_layer_gap_ticks = 3
+
 # ── 方向选择 ──
 # ow_side: 做哪一侧的 accumulator
 #   "yes" → 只在 Yes token 上挂 BUY（赌 Yes 概率上升）

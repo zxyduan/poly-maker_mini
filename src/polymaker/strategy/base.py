@@ -42,6 +42,9 @@ class StrategyInputs:
     yes_exit_urgency: float = 0.0
     no_exit_urgency: float = 0.0
     hours_to_end: float | None = None
+    trend_streak: int = 0  # 连续同向桶数（正=涨，负=跌），来自采集器
+    our_bids: tuple[float, ...] = ()  # 我们自己挂的买单价格列表
+    our_asks: tuple[float, ...] = ()  # 我们自己挂的卖单价格列表
 
 
 class StrategyFn(Protocol):

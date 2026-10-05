@@ -16,6 +16,7 @@ Within ``ow_exit_days_before`` of end date it is sell-only.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 
 from polymaker.config import OneWayProfile
 from polymaker.domain import Quote, Regime, Side, TargetQuotes
@@ -23,6 +24,124 @@ from polymaker.marketdata.orderbook import BookLevel, OrderBook
 from polymaker.strategy.base import StrategyInputs
 
 _EPS = 1e-9
+
+
+def calc_fair_value(p: OneWayProfile) -> float:
+    """计算今天的合理价值（按天线性衰减，到期归零）。
+
+    假设：
+    - fv_initial 是今天的合理价值
+    - fv_end_date 是到期日期
+    - 从今天到到期日，合理价值线性衰减到 0
+
+    Args:
+        p: OneWayProfile 配置
+
+    Returns:
+        今天的合理价值，如果没有配置到期日期，返回 fv_initial
+    """
+    if not p.fv_end_date:
+        return p.fv_initial
+
+    try:
+        end_date = datetime.fromisoformat(p.fv_end_date).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        days_left = (end_date - now).total_seconds() / 86400.0
+
+        if days_left <= 0:
+            return 0.0  # 到期了，合理价值归零
+
+        # 简化：fv_initial 就是今天的合理价值
+        # 我们不衰减过去，只从现在开始衰减
+        # 这样配置的 fv_initial 就是当前的合理价值
+        return p.fv_initial
+    except (ValueError, TypeError):
+        return p.fv_initial
+
+
+def _get_market_scenario(
+    trend_streak: int,
+    threshold_up: int = 3,
+    threshold_down: int = -3,
+) -> str:
+    """判断市场场景：平静期/趋势向上期/趋势向下期。
+
+    Args:
+        trend_streak: 连续同向桶数（正=涨，负=跌）
+        threshold_up: 连续涨多少桶算趋势向上
+        threshold_down: 连续跌多少桶算趋势向下
+
+    Returns:
+        "calm" | "up_trend" | "down_trend"
+    """
+    if trend_streak >= threshold_up:
+        return "up_trend"
+    elif trend_streak <= threshold_down:
+        return "down_trend"
+    else:
+        return "calm"
+
+
+def _adjust_price_for_wall(
+    book: OrderBook,
+    side: Side,
+    target_price: float,
+    tick: float,
+    our_size: float,
+    our_prices: tuple[float, ...] = (),
+) -> float:
+    """调整挂单价格，避开别人的墙。
+
+    如果我们算出来的价格旁边有别人的墙（挂单量 >= 我们份额的 50%），
+    就比墙低 1 tick 挂单，抢在墙前面成交。
+    自己的挂单不用避。
+
+    Args:
+        book: 订单簿
+        side: 买还是卖
+        target_price: 我们算出来的目标价格
+        tick: 最小价格单位
+        our_size: 我们这层要挂的份额
+        our_prices: 我们自己挂单的价格列表
+
+    Returns:
+        调整后的价格
+    """
+    if book is None:
+        return target_price
+
+    # 墙的阈值：别人的挂单量 >= 我们份额的 50%
+    wall_threshold = our_size * 0.5
+
+    # 看 target_price 左右 1 tick 的位置有没有墙
+    levels_to_check = [
+        target_price - tick,
+        target_price,
+        target_price + tick,
+    ]
+
+    book_levels = book.bids if side == Side.BUY else book.asks
+
+    for level_price in levels_to_check:
+        # 如果这个价位是我们自己的挂单，跳过
+        is_our_order = any(abs(p - level_price) < tick / 2 for p in our_prices)
+        if is_our_order:
+            continue
+
+        # 找到这个价位的挂单量
+        size_at_level = 0.0
+        for p, s in book_levels.items():
+            if abs(p - level_price) < tick / 2:
+                size_at_level = s
+                break
+
+        # 如果这个价位有墙（别人的）
+        if size_at_level >= wall_threshold:
+            # 比墙低 1 tick 挂单
+            adjusted = level_price - tick if side == Side.SELL else level_price + tick
+            return round(adjusted, 6)
+
+    return target_price
 
 
 def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
@@ -53,6 +172,27 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
     q_max_shares = p.q_max_usdc / max(inp.fv, tick)
     util = (held / q_max_shares) if q_max_shares > 0 else 0.0
 
+    # ── 计算今天的合理价值 ──
+    fv = calc_fair_value(p)
+
+    # ── 判断市场场景 ──
+    scenario = _get_market_scenario(inp.trend_streak)
+
+    # ─️ 根据场景调整挂单层数 ──
+    effective_buy_layers = p.buy_layers
+    effective_sell_layers = p.sell_layers
+
+    if scenario == "up_trend":
+        # 趋势向上：少挂 1 层买单，别追高
+        effective_buy_layers = max(1, p.buy_layers - 1)
+    elif scenario == "down_trend":
+        # 趋势向下：正常挂买单，逢低吸筹
+        pass
+
+    # ── 计算每层间隔（根据波动率调整）──
+    # 简化：用 base_layer_gap_ticks，后续可以根据 adaptive 的 vol_regime_factor 调整
+    layer_gap_ticks = p.base_layer_gap_ticks
+
     near_end = inp.hours_to_end is not None and inp.hours_to_end <= p.ow_exit_days_before * 24.0
     panic = inp.toxicity >= p.ow_panic_toxicity
 
@@ -61,26 +201,7 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
     best_bid: float | None = bb.price if bb else None
     best_ask: float | None = ba.price if ba else None
 
-    # ── exits: SELL held inventory, passive one tick under the ask ───────
-    if held >= m.min_order_size:
-        if near_end or panic:
-            # into the bid (post just above best_bid = maker near the touch)
-            price = (best_bid + tick) if best_bid is not None else (
-                (best_ask - tick) if best_ask is not None else None
-            )
-        else:
-            price = (best_ask - tick) if best_ask is not None else None
-        # post-only SELL must rest strictly above the best bid. When the spread
-        # is a single tick, best_ask - tick == best_bid and would cross through
-        # it — floor at best_bid + tick (joins the ask instead of sweeping it).
-        if price is not None and best_bid is not None:
-            price = max(price, best_bid + tick)
-        if price is not None and 0.0 < price < 1.0:
-            size = math.floor(held * 100) / 100
-            if size >= m.min_order_size:
-                quotes.append(Quote(tok, Side.SELL, round(price, dec), size))
-
-    # ── buys: weighted pyramid chained under successive walls ───────────
+    # ── 1. 挂买单（围绕合理价值，在合理价值以下）──
     can_buy = (
         not near_end
         and util < p.ow_inv_mid
@@ -91,25 +212,138 @@ def construct_one_way_quotes(inp: StrategyInputs) -> TargetQuotes:
     if can_buy and book is not None:
         scale = 1.0 if util < p.ow_inv_low else 0.5
         scale *= max(0.0, min(1.0, inp.risk_size_scale))
-        wall_notional = max(m.volume_24hr * p.ow_wall_pct_of_24h, m.min_order_size * tick)
-        # first layer sits below the current touch; each subsequent layer must be
-        # strictly cheaper than the previous by >= min_gap_ticks.
-        ceiling = (best_bid - p.ow_wall_skip_ticks * tick) if best_bid is not None else 1.0
-        prev_price = 1.0
-        for w in p.ow_pyramid_shares:
-            wall_price = _find_wall(book, below=ceiling, min_notional=wall_notional)
-            if wall_price is None:
-                break
-            price = round(wall_price + p.ow_wall_skip_ticks * tick, dec)
-            # monotonic: each layer strictly below the last by the min gap
-            if price >= prev_price - p.ow_wall_min_gap_ticks * tick + _EPS:
-                break
-            usdc = p.base_size_usdc * w * scale
-            shares = math.floor((usdc / max(price, tick)) * 100) / 100
-            if shares >= m.min_order_size:
-                quotes.append(Quote(tok, Side.BUY, price, shares))
+
+        # 先计算第一层买单价格
+        # 1. 先比较 inp.fv 和我们的合理价值 * 1.2，谁小取谁
+        # 2. 再和盘口 best_bid 比较，谁小取谁
+        first_buy_candidate = min(inp.fv, fv * 1.2)
+        if best_bid is not None:
+            first_buy_price = min(first_buy_candidate, best_bid)
+        else:
+            first_buy_price = first_buy_candidate
+
+        # 根据波动率计算每层间隔
+        vol = inp.vol_short
+        if vol > 0.05:  # 高波动
+            vol_gap = 5
+        elif vol > 0.02:  # 正常波动
+            vol_gap = 3
+        else:  # 低波动
+            vol_gap = 1
+
+        # 第 1 层：参考盘口 best_bid，确保是挂单
+        first_buy_candidate = min(inp.fv, fv * 1.2)
+        if best_bid is not None:
+            first_buy_price = min(first_buy_candidate, best_bid)
+        else:
+            first_buy_price = first_buy_candidate
+
+        # 挂 effective_buy_layers 层买单
+        prev_price = first_buy_price
+        for i in range(effective_buy_layers):
+            layer_num = i + 1
+            if layer_num == 1:
+                price = first_buy_price
+            else:
+                # 第 2、3、4 层：围绕 our_fv 往下挂
+                price = fv - (layer_num - 1) * vol_gap * tick
+
+            # 保护：如果价格 >= 上一层，就用 上一层 - 1 tick，确保不重复
+            if layer_num > 1 and price >= prev_price:
+                price = prev_price - tick
+
             prev_price = price
-            ceiling = price - p.ow_wall_min_gap_ticks * tick
+
+            # 确保价格大于 0
+            if price <= 0:
+                break
+
+            # 确保价格大于 0
+            if price <= 0:
+                break
+
+            # 每层的份额（金字塔：越远越少）
+            # 保护：如果 layers 比 pyramid_shares 长，就用最后一个权重
+            share_index = min(i, len(p.ow_pyramid_shares) - 1)
+            usdc = p.base_size_usdc * p.ow_pyramid_shares[share_index] * scale
+            shares = math.floor((usdc / max(price, tick)) * 100) / 100
+
+            if shares >= m.min_order_size:
+                quotes.append(Quote(tok, Side.BUY, round(price, dec), shares))
+
+    # ── 2. 挂卖单（围绕合理价值，在合理价值以上）──
+    if held >= m.min_order_size:
+        # 判断成本 vs 合理价值
+        cost_per_share = pos.avg_price if hasattr(pos, 'avg_price') else 0.0
+        cost_above_fv = cost_per_share > fv  # 买贵了
+
+        # 判断价格在合理价值上方还是下方
+        price_above_fv = (best_ask is not None and best_ask > fv)
+
+        # 决定挂几层卖单
+        if near_end or panic:
+            # 接近到期或恐慌：加速卖
+            sell_layer_count = effective_sell_layers
+        elif cost_above_fv and not price_above_fv:
+            # 买贵了 + 价格在合理价值下方：只挂 1 层，加速跑
+            sell_layer_count = 1
+        elif not cost_above_fv and not price_above_fv:
+            # 买便宜了 + 价格在合理价值下方：只挂 1 层，慢慢卖
+            sell_layer_count = 1
+        else:
+            # 正常情况：挂全部 effective_sell_layers 层
+            sell_layer_count = effective_sell_layers
+
+        # 挂卖单
+        # 先计算第一层卖单价格
+        # 1. 先比较 inp.fv 和 our_fv * 0.9，谁小取谁
+        # 2. 再和盘口 best_ask 比较，谁大取谁
+        first_sell_candidate = min(inp.fv, fv * 0.9)
+        if best_ask is not None:
+            first_sell_price = max(first_sell_candidate, best_ask)
+        else:
+            first_sell_price = first_sell_candidate
+
+        # 根据波动率计算每层间隔（和买单一样）
+        vol = inp.vol_short
+        if vol > 0.05:  # 高波动
+            sell_vol_gap = 5
+        elif vol > 0.02:  # 正常波动
+            sell_vol_gap = 3
+        else:  # 低波动
+            sell_vol_gap = 1
+
+        for i in range(sell_layer_count):
+            layer_num = i + 1
+            if sell_layer_count == 1 and not price_above_fv:
+                # 价格在合理价值下方：挂在最新卖单位置附近
+                if best_ask is not None:
+                    price = best_ask
+                else:
+                    break
+            else:
+                if layer_num == 1:
+                    price = first_sell_price
+                else:
+                    # 其他层：在第一层的基础上，往上排，每层间隔 sell_vol_gap tick
+                    price = first_sell_price + (layer_num - 1) * sell_vol_gap * tick
+
+            # 确保价格小于 1
+            if price >= 1.0:
+                break
+
+            # post-only SELL must rest strictly above the best bid
+            if best_bid is not None:
+                price = max(price, best_bid + tick)
+
+            size = math.floor(held * 100 / sell_layer_count) / 100
+
+            # 墙位置调整：比别人的墙低 1 tick
+            if book is not None and size >= m.min_order_size:
+                price = _adjust_price_for_wall(book, Side.SELL, price, tick, size, inp.our_asks)
+
+            if size >= m.min_order_size:
+                quotes.append(Quote(tok, Side.SELL, round(price, dec), size))
 
     return TargetQuotes(cid, inp.regime, tuple(quotes))
 

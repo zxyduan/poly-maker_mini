@@ -87,6 +87,9 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     vol_long          REAL NOT NULL DEFAULT 0.0,
     vol_regime        TEXT NOT NULL DEFAULT '',
 
+    our_fv            REAL NOT NULL DEFAULT 0.0,  -- 我们自己算的合理价值（按天衰减）
+    market_fv         REAL NOT NULL DEFAULT 0.0,  -- 市场算的合理价值（实时算的）
+
     collected_ts      REAL NOT NULL,
 
     PRIMARY KEY (condition_id, bucket_ts)
@@ -135,6 +138,8 @@ class Snapshot:
     vol_short: float
     vol_long: float
     vol_regime: str
+    our_fv: float = 0.0    # 我们自己算的合理价值（按天衰减）
+    market_fv: float = 0.0  # 市场算的合理价值（实时算的）
 
 
 # ── Store 层 ───────────────────────────────────────────────────────────────
@@ -185,6 +190,8 @@ class SnapshotStore:
         vol_short: float,
         vol_long: float,
         vol_regime: str,
+        our_fv: float = 0.0,
+        market_fv: float = 0.0,
     ) -> None:
         """UPSERT 写入一个2小时桶的快照。
 
@@ -199,8 +206,9 @@ class SnapshotStore:
                 trend_direction, drawdown_from_high, price_percentile,
                 bid_depth_top5, ask_depth_top5, bid_wall_count, bid_depth_change,
                 vol_short, vol_long, vol_regime,
+                our_fv, market_fv,
                 collected_ts
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(condition_id, bucket_ts) DO UPDATE SET
                 slug=excluded.slug,
                 price_open=excluded.price_open,
@@ -221,6 +229,8 @@ class SnapshotStore:
                 vol_short=excluded.vol_short,
                 vol_long=excluded.vol_long,
                 vol_regime=excluded.vol_regime,
+                our_fv=excluded.our_fv,
+                market_fv=excluded.market_fv,
                 collected_ts=excluded.collected_ts""",
             (
                 condition_id, slug, bucket_ts,
@@ -230,6 +240,7 @@ class SnapshotStore:
                 trend_direction, drawdown_from_high, price_percentile,
                 bid_depth_top5, ask_depth_top5, bid_wall_count, bid_depth_change,
                 vol_short, vol_long, vol_regime,
+                our_fv, market_fv,
                 time.time(),
             ),
         )
@@ -331,7 +342,14 @@ class SnapshotCollector:
 
     # ── 主流程：一次采集 ──────────────────────────────────────────────
 
-    async def collect(self, condition_id: str, yes_token_id: str) -> None:
+    async def collect(
+        self,
+        condition_id: str,
+        yes_token_id: str,
+        *,
+        fv_initial: float = 0.0,
+        fv_end_date: str = "",
+    ) -> None:
         """跑一次完整的采集：拉数据 → 算特征 → 写入 → 清理。"""
 
         # 0. 新市场自动回填历史（第一次遇到才跑）
@@ -380,7 +398,28 @@ class SnapshotCollector:
         vol_short, vol_long, vol_regime = _calc_volatility(history)
         bid_depth_change = _calc_depth_change(book_depth.bid_top5, history)
 
-        # 6. 写入（先从 markets 表查 slug）
+        # 6. 算合理价值
+        # market_fv：从订单簿算微价格（简化：用价格中间价）
+        market_fv = 0.0
+        if price_open > 0 and price_close > 0:
+            market_fv = (price_open + price_close) / 2
+
+        # our_fv：我们自己算的合理价值（按天衰减）
+        our_fv = 0.0
+        if fv_initial > 0 and fv_end_date:
+            try:
+                from datetime import datetime, timezone
+                end_date = datetime.fromisoformat(fv_end_date).replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                days_left = (end_date - now).total_seconds() / 86400.0
+                if days_left > 0:
+                    our_fv = fv_initial
+                else:
+                    our_fv = 0.0  # 到期了，归零
+            except (ValueError, TypeError):
+                our_fv = fv_initial
+
+        # 7. 写入（先从 markets 表查 slug）
         slug = self._store.get_slug(condition_id)
         self._store.upsert_bucket(
             condition_id, bucket_ts,
@@ -403,6 +442,8 @@ class SnapshotCollector:
             vol_short=vol_short,
             vol_long=vol_long,
             vol_regime=vol_regime,
+            our_fv=our_fv,
+            market_fv=market_fv,
         )
 
         # 保存成交量基线
@@ -581,6 +622,8 @@ def _row_to_snapshot(row: sqlite3.Row) -> Snapshot:
         vol_short=row["vol_short"],
         vol_long=row["vol_long"],
         vol_regime=row["vol_regime"],
+        our_fv=row["our_fv"] if "our_fv" in row.keys() else 0.0,
+        market_fv=row["market_fv"] if "market_fv" in row.keys() else 0.0,
     )
 
 

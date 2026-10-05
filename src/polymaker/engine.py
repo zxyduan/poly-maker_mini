@@ -501,11 +501,23 @@ class Engine:
         quoter = self.strategy_fn.get(cid)
         if quoter is None:  # market added outside _resolve_markets (tests/manual)
             quoter = self.strategy_fn[cid] = get_strategy(p.type)
+
+        # 从采集器读最近的 trend_streak
+        snap = self.snapshot_store.last_snapshot(cid)
+        trend_streak = snap.trend_streak if snap else 0
+
+        # 读我们自己的挂单价格列表
+        our_bids = tuple(o.price for o in self.state.orders_for(meta.yes.token_id) if o.side == Side.BUY)
+        our_asks = tuple(o.price for o in self.state.orders_for(meta.yes.token_id) if o.side == Side.SELL)
+
         tq = quoter(StrategyInputs(
             meta=meta, profile=p, yes_book=yes_book, no_book=no_book,
             now=now, fv=fv, vol_short=est.vol.short, toxicity=est.markout.toxicity,
             pos_yes=pos_yes, pos_no=pos_no, regime=regime,
             risk_size_scale=rd.size_scale, hours_to_end=hours_to_end,
+            trend_streak=trend_streak,
+            our_bids=our_bids,
+            our_asks=our_asks,
         ))
 
         live = self.state.orders_for(meta.yes.token_id) + self.state.orders_for(meta.no.token_id)
